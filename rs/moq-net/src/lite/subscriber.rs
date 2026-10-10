@@ -783,10 +783,22 @@ impl<S: crate::transport::poll::Session> GroupRecv<S> {
 						let mut subs = self.subscriber.subscribes.lock();
 						let entry = subs.get_mut(&hdr.subscribe).ok_or(Error::Cancel)?;
 
+						// The subscription's end waits until this stream is read, and counts it
+						// whatever becomes of its group.
+						let now = self.subscriber.runtime.now();
+						let reading = Reading::open(&entry.tail, None, now);
+
 						let group_info = group::Info { sequence: hdr.sequence };
 						// Stats (groups/frames/bytes) are counted in the model as the group
 						// is written, through the tagged `track::Producer`.
-						let mut group = match entry.producer.create_group(group_info) {
+						let created = entry.producer.create_group(group_info);
+						// The group is accounted once the cache holds it, created here or
+						// already by a fetch, so a fetch held for the feed that sees it
+						// accounted also finds it.
+						if matches!(created, Ok(_) | Err(Error::Duplicate)) {
+							reading.account(hdr.sequence, now);
+						}
+						let mut group = match created {
 							Ok(group) => group,
 							// The group is at or past the end the publisher declared, which no
 							// later stream can repair. Before lite-05 only a local finish sets
@@ -806,10 +818,6 @@ impl<S: crate::transport::poll::Session> GroupRecv<S> {
 							}
 							Err(err) => return Poll::Ready(Err(err)),
 						};
-						// The subscription's end waits until this stream is read. Accounted
-						// once the cache holds the group, so a fetch held for the feed that
-						// sees it accounted also finds it.
-						let reading = Reading::open(&entry.tail, Some(hdr.sequence), self.subscriber.runtime.now());
 						// The stream may carry only the tail of the group; number the frames
 						// from where the publisher said they start so a reader splicing
 						// across routes lines them up.
@@ -1632,6 +1640,58 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	/// A group stream whose group a fetch already cached still counts toward the
+	/// subscription's end, and accounts for its group, so the end settles without the grace.
+	#[tokio::test]
+	async fn a_duplicate_group_stream_is_still_counted() {
+		use crate::transport::poll::Session as _;
+
+		let version = Version::Lite07;
+		let mut script = Vec::new();
+		lite::Group {
+			subscribe: 7,
+			sequence: 3,
+			frame_start: 0,
+		}
+		.encode(&mut script, version)
+		.unwrap();
+		let mut session = crate::lite::test_transport::ScriptedSession::eof(script);
+		let subscriber = Subscriber::new(SubscriberConfig {
+			runtime: crate::time::Clock::tokio(),
+			session: session.clone(),
+			origin: origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
+			recv_bandwidth: None,
+			version,
+			peer_setup: Default::default(),
+			peer_hop: None,
+			cost: None,
+			going_away: Default::default(),
+		});
+
+		let track = track::Producer::new(std::sync::Arc::new(crate::broadcast::Info::default()), "video", None);
+		let _fetched = track.create_group(group::Info { sequence: 3 }).unwrap();
+		let tail = kio::Producer::new(Tail::default());
+		subscriber.subscribes.lock().insert(
+			7,
+			TrackEntry {
+				producer: track.clone(),
+				timescale: Some(Timescale::default()),
+				tail: tail.clone(),
+			},
+		);
+
+		let (_, recv) = session.open_bi().await.unwrap();
+		let mut group = GroupRecv::new(subscriber, Reader::new(recv, version));
+		let res = kio::wait(|waiter| group.poll_serve(waiter)).await;
+		assert!(matches!(res, Err(Error::Duplicate)), "{res:?}");
+		let (streams, covered) = {
+			let tail = tail.read();
+			(tail.streams(), tail.covers(3..4))
+		};
+		assert_eq!(streams, 1, "the stream counts toward the end");
+		assert!(covered, "its group is accounted for");
 	}
 
 	/// A SUBSCRIBE_END below a group already received contradicts that group. lite-05

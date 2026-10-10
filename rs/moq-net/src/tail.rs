@@ -187,6 +187,15 @@ impl Reading {
 		}
 	}
 
+	/// Account for `group`, the one this stream carries, once it is known to arrive.
+	pub fn account(&self, group: u64, now: Instant) {
+		if let Some(tail) = &self.tail
+			&& let Ok(mut state) = tail.write()
+		{
+			state.account(group..group.saturating_add(1), now);
+		}
+	}
+
 	/// Stop holding the end open while the stream waits on another one, which holds it
 	/// open itself if its header arrived.
 	pub fn park(&mut self) {
