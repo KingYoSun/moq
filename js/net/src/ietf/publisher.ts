@@ -451,6 +451,8 @@ export class Publisher {
 					const unsupported =
 						params.forward === false ||
 						params.bytes.size > 0 ||
+						params.subscriptionFilter !== undefined ||
+						params.largest !== undefined ||
 						params.rangeFilters ||
 						params.trackPropertyFilter ||
 						[...params.vars.keys()].some((key) => key !== 0x10n && key !== 0x20n);
@@ -474,12 +476,16 @@ export class Publisher {
 				version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16
 					? updates
 					: race([updates, stream.writer.closed]);
+			let publishError: Error | undefined;
 			void requestEnded.then(
 				() => {
 					if (!finished) unsubscribe();
 				},
-				// A reset is always the peer.
-				() => unsubscribe(),
+				// Updates can fail after the serving loop ends while its last groups drain.
+				(err: unknown) => {
+					publishError = error(err);
+					unsubscribe();
+				},
 			);
 
 			// Every group started, until its stream finishes or resets, and the data streams
@@ -534,7 +540,6 @@ export class Publisher {
 						})
 					: Promise.resolve();
 
-			let publishError: Error | undefined;
 			let ended = false;
 			try {
 				const served = Symbol("served");

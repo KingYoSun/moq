@@ -13,9 +13,12 @@ import type { Producer as TrackProducer } from "../track.ts";
 import { wireOf } from "../wire.ts";
 import { NativeSession, type Session } from "./adapter.ts";
 import type * as Cluster from "./cluster.ts";
+import { toRequestCode } from "./error.ts";
 import { Fetch, FetchHeader } from "./fetch.ts";
+import * as Message from "./message.ts";
 import { Frame, Group as GroupMessage } from "./object.ts";
-import { PublishDone } from "./publish.ts";
+import { Parameters } from "./parameters.ts";
+import { PublishDone, PublishDoneStatus } from "./publish.ts";
 import { PublishNamespace, PublishNamespaceUpdate } from "./publish_namespace.ts";
 import { Publisher } from "./publisher.ts";
 import { RequestError, RequestOk } from "./request.ts";
@@ -2384,3 +2387,92 @@ for (const version of [
 		}
 	});
 }
+
+/** Send an update on an established subscription without closing the requester. */
+async function sendSubscriptionUpdate(client: Stream, params: Parameters, version: IetfVersion) {
+	await client.writer.u53(0x02);
+	await Message.encode(client.writer, async (writer) => {
+		await writer.u62(1n);
+		if (version === Version.DRAFT_17) await writer.u62(7n);
+		await params.encode(writer, version);
+	});
+}
+
+for (const version of [
+	Version.DRAFT_17,
+	Version.DRAFT_18,
+	Version.DRAFT_19,
+	Version.DRAFT_20,
+	Version.DRAFT_21,
+	Version.DRAFT_22,
+]) {
+	for (const field of ["filter", "largest"] as const) {
+		test(`unsupported subscription update ${field} is refused in ${version}`, async () => {
+			const fx = fixture(version);
+			const track = fx.broadcast.createTrack("video");
+			const { client } = await runSubscribe(
+				fx,
+				new Subscribe({
+					requestId: 7n,
+					trackNamespace: Path.from("test"),
+					trackName: "video",
+					subscriberPriority: 0,
+				}),
+			);
+			try {
+				const params = new Parameters();
+				if (field === "filter") params.subscriptionFilter = { kind: "nextObject" };
+				else params.largest = { groupId: 1n, objectId: 0n };
+				await sendSubscriptionUpdate(client, params, version);
+				expect(await client.reader.u53()).toBe(RequestError.id);
+				expect((await RequestError.decode(client.reader, version)).errorCode).toBe(
+					toRequestCode("not_supported", "subscribe", version),
+				);
+				expect(await client.reader.u53()).toBe(PublishDone.id);
+				expect((await PublishDone.decode(client.reader, version)).statusCode).toBe(
+					PublishDoneStatus.UPDATE_FAILED,
+				);
+			} finally {
+				track.close();
+				client.close();
+				fx.close();
+			}
+		});
+	}
+}
+
+test("unsupported subscription update remains UPDATE_FAILED while the last group drains", async () => {
+	const fx = fixture();
+	const track = fx.broadcast.createTrack("video");
+	const queued = Promise.withResolvers<void>();
+	const slot = Promise.withResolvers<void>();
+	const create = fx.pair.server.createUnidirectionalStream.bind(fx.pair.server);
+	fx.pair.server.createUnidirectionalStream = async (options?: WebTransportSendStreamOptions) => {
+		queued.resolve();
+		await slot.promise;
+		return create(options);
+	};
+	const { client } = await runSubscribe(
+		fx,
+		new Subscribe({ requestId: 7n, trackNamespace: Path.from("test"), trackName: "video", subscriberPriority: 0 }),
+	);
+	try {
+		writeGroup(track, 1);
+		await queued.promise;
+		track.close();
+		const params = new Parameters();
+		params.forward = false;
+		await sendSubscriptionUpdate(client, params, V20);
+		expect(await client.reader.u53()).toBe(RequestError.id);
+		expect((await RequestError.decode(client.reader, V20)).errorCode).toBe(
+			toRequestCode("not_supported", "subscribe", V20),
+		);
+		expect(await client.reader.u53()).toBe(PublishDone.id);
+		expect((await PublishDone.decode(client.reader, V20)).statusCode).toBe(PublishDoneStatus.UPDATE_FAILED);
+	} finally {
+		slot.resolve();
+		track.close();
+		client.close();
+		fx.close();
+	}
+});
