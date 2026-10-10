@@ -2138,15 +2138,16 @@ where
 		let declared = self.peer_setup.get().await.hidden;
 		let origin = origin.discovery(!declared || msg.hidden || self.origin.includes_hidden());
 
-		// Unless the peer asked to be told only on request, it has already heard what an
-		// unsolicited PUBLISH_NAMESPACE can say. Repeating it here would leave it holding
-		// two sources for one namespace, so this stream carries only what that loop hid
-		// from the empty prefix and this request may see, and otherwise simply stays open
-		// until the peer is done with it.
-		let origin = match self.requires_solicitation().await {
-			true => origin,
-			false if !declared || self.origin.includes_hidden() => origin.empty(),
-			false => origin.beyond(&self.origin.clone().discovery(false)),
+		// NAMESPACE is discovery, so draft 16+ fills the request even after an unsolicited
+		// PUBLISH_NAMESPACE. Earlier drafts only send advertisements the other loop hid.
+		let origin = if matches!(self.version, Version::Draft14 | Version::Draft15) {
+			match self.requires_solicitation().await {
+				true => origin,
+				false if !declared || self.origin.includes_hidden() => origin.empty(),
+				false => origin.beyond(&self.origin.clone().discovery(false)),
+			}
+		} else {
+			origin
 		};
 
 		let ns = Namespaces::new(peer, target);
@@ -5436,8 +5437,8 @@ mod tests {
 	#[tokio::test]
 	async fn hidden_namespaces_need_an_opt_in() {
 		for (solicit, prefix, hidden, cam, stats) in [
-			(Some(false), "", false, 1, 0),
-			(Some(false), "", true, 1, 1),
+			(Some(false), "", false, 2, 0),
+			(Some(false), "", true, 2, 1),
 			(Some(false), ".stats", false, 1, 1),
 			(Some(true), "", false, 1, 0),
 			(Some(true), "", true, 1, 1),
@@ -5479,7 +5480,16 @@ mod tests {
 								scoped,
 							})
 							.await;
-							let expected = usize::from(!declared || hidden || prefix == ".stats");
+							let on_stream = !declared || hidden || prefix == ".stats";
+							let unsolicited = solicit != Some(true) && !declared;
+							let legacy = matches!(version, Version::Draft14 | Version::Draft15);
+							let inline = if legacy {
+								(solicit == Some(true) && on_stream)
+									|| (solicit != Some(true) && declared && (hidden || prefix == ".stats"))
+							} else {
+								on_stream
+							};
+							let expected = usize::from(inline) + usize::from(unsolicited);
 							assert_eq!(
 								occurrences(&log, b"node"),
 								expected,
@@ -5492,20 +5502,24 @@ mod tests {
 		}
 	}
 
-	/// The regression that made announces solicited in the first place: a namespace sent
-	/// as both PUBLISH_NAMESPACE and NAMESPACE leaves the peer holding two sources for
-	/// one broadcast, and whichever arrives second replaces the one the first attached.
-	/// The peer's SETUP picks which loop carries it, so the other stays quiet and the
-	/// namespace goes out exactly once either way.
-	#[tokio::test]
-	async fn each_namespace_is_advertised_exactly_once() {
-		let (unsolicited, streams) = advertise_both_ways(Some(false)).await;
-		assert_eq!(unsolicited, 1, "a peer that required nothing is told once");
-		assert_eq!(streams, 2, "on its own PUBLISH_NAMESPACE request");
-
-		let (solicited, streams) = advertise_both_ways(Some(true)).await;
-		assert_eq!(solicited, 1, "a peer that asked to be told on request is told once");
-		assert_eq!(streams, 1, "inline on the SUBSCRIBE_NAMESPACE stream it asked on");
+	/// Namespace discovery on a request stream also reaches non-SOLICIT peers from draft 16.
+	#[tokio::test(start_paused = true)]
+	async fn a_non_solicit_peer_hears_a_namespace_both_ways() {
+		let (times, streams) = advertise_both_ways(Some(false)).await;
+		assert_eq!(times, 2, "PUBLISH_NAMESPACE and NAMESPACE");
+		assert_eq!(streams, 2, "one subscription and one PUBLISH_NAMESPACE request");
+		let (once, streams) = advertise_both_ways(Some(true)).await;
+		assert_eq!(once, 1);
+		assert_eq!(streams, 1);
+		for version in [Version::Draft14, Version::Draft15] {
+			let log = advertise_with_hidden(Discovery {
+				version,
+				solicit: Some(false),
+				..Discovery::default()
+			})
+			.await;
+			assert_eq!(occurrences(&log, b"cam"), 1, "{version}");
+		}
 	}
 
 	/// A peer out of stream credit parks the open. That must not wedge the loop, because
