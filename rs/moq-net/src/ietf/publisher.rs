@@ -2040,8 +2040,8 @@ where
 	/// ([`solicit`](super::solicit)),
 	/// and then this loop does nothing and
 	/// [`Self::run_subscribe_namespace_stream`] carries the advertisements instead.
-	/// Exactly one of the two is live, which is what keeps the peer from hearing a
-	/// namespace twice.
+	/// On draft 16 and later, an explicit subscription also fills its requested
+	/// namespaces even when this unsolicited loop is active.
 	pub async fn run_publish_namespaces(self) -> Result<(), Error> {
 		if self.requires_solicitation().await {
 			return Ok(());
@@ -2065,8 +2065,9 @@ where
 	///
 	/// All the announce state is local to this task (mirroring `lite::Publisher`'s
 	/// announce handling): whatever this subscription advertised is withdrawn
-	/// when its stream ends. It only advertises anything when the peer asked to be told
-	/// on request; otherwise [`Self::run_publish_namespaces`] has already said it all.
+	/// when its stream ends. Drafts 14 and 15 suppress visible namespaces already
+	/// carried by [`Self::run_publish_namespaces`]; later drafts fill the request
+	/// independently of unsolicited advertisements.
 	async fn run_subscribe_namespace_stream(
 		self,
 		mut stream: Stream<S, Version>,
@@ -5432,8 +5433,8 @@ mod tests {
 	}
 
 	/// A hidden namespace reaches only a subscription that opted in or named its dot
-	/// segment. With the unsolicited loop live, the subscription stream carries just
-	/// what that loop hid, so nothing is advertised twice.
+	/// segment. Modern subscriptions include visible namespaces even when the
+	/// unsolicited loop also advertises them; drafts 14 and 15 suppress duplicates.
 	#[tokio::test]
 	async fn hidden_namespaces_need_an_opt_in() {
 		for (solicit, prefix, hidden, cam, stats) in [
