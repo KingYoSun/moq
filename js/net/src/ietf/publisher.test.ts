@@ -2323,3 +2323,64 @@ for (const version of [Version.DRAFT_15, Version.DRAFT_19] as const) {
 		}
 	}
 }
+
+for (const version of [
+	Version.DRAFT_17,
+	Version.DRAFT_18,
+	Version.DRAFT_19,
+	Version.DRAFT_20,
+	Version.DRAFT_21,
+	Version.DRAFT_22,
+]) {
+	test(`requester FIN is version gated for subscription ${version}`, async () => {
+		const pair = createMockTransportPair(ALPN.DRAFT_19);
+		const session = new NativeSession(pair.server, version, true);
+		const { pub, origin } = publisher(pair.server, { session });
+		const broadcast = publish(origin, Path.from("test"));
+		const track = broadcast.createTrack("video");
+		const client = await Stream.open(pair.client, { version });
+		const server = await Stream.accept(pair.server, version);
+		if (!server) throw new Error("missing stream");
+		const serving = pub.runSubscribe(
+			new Subscribe({
+				requestId: 0n,
+				trackNamespace: Path.from("test"),
+				trackName: "video",
+				subscriberPriority: 128,
+			}),
+			server,
+		);
+		const uni = pair.client.incomingUnidirectionalStreams.getReader();
+		try {
+			expect(await client.reader.u53()).toBe(SubscribeOk.id);
+			await SubscribeOk.decode(client.reader, version);
+			client.writer.close();
+			await client.writer.closed;
+			if (version <= Version.DRAFT_18) {
+				await serving;
+				expect(track.subscription.peek()).toBeUndefined();
+			} else {
+				const group = new GroupProducer(0);
+				group.writeFrame({
+					payload: new TextEncoder().encode("after FIN"),
+					timestamp: Timestamp.fromMillis(0),
+				});
+				group.close();
+				track.writeGroup(group);
+				const next = await uni.read();
+				expect(next.done).toBeFalse();
+				if (next.done) throw new Error("no group after FIN");
+				const reader = new Reader(next.value, undefined, version);
+				expect((await GroupMessage.decode(reader, version)).groupId).toBe(0);
+				client.reader.stop(new Error("cancel"));
+				await serving;
+			}
+		} finally {
+			client.close();
+			track.close();
+			broadcast.close();
+			origin.close();
+			uni.releaseLock();
+		}
+	});
+}
