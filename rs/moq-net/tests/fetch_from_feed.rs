@@ -6,6 +6,8 @@ mod support;
 
 use std::time::Duration;
 
+use futures::FutureExt;
+
 use moq_net::{Hop, Timestamp, Version};
 use support::harness::{MockConnectOptions, connect_mock};
 
@@ -93,6 +95,37 @@ async fn a_fetch_is_served_from_the_live_feed() {
 				.is_err(),
 			"{version}: answered before the group exists"
 		);
+		relay.track.write_frame(Timestamp::ZERO, &b"1"[..]).unwrap();
+		let mut group = tokio::time::timeout(TIMEOUT, fetching)
+			.await
+			.expect("fetch timed out")
+			.unwrap_or_else(|err| panic!("{version}: {err}"));
+		let frame = tokio::time::timeout(TIMEOUT, group.read_frame())
+			.await
+			.expect("read timed out");
+		assert_eq!(&frame.unwrap().expect("a frame").payload[..], b"1", "{version}");
+	}
+}
+
+/// A fetch that reaches the relay alongside the subscription that will carry it, as a
+/// recorder starting on an uncached group sends them, waits for that feed. The relay
+/// already serves the track, with no feed, for an earlier fetch.
+#[tokio::test(start_paused = true)]
+async fn a_fetch_waits_for_a_feed_opened_with_it() {
+	for version in VERSIONS {
+		let mut relay = relay(version).await;
+		let err = fetch_err(&relay, 0).await;
+		assert!(matches!(err, moq_net::Error::NotFound), "{version}: no feed: {err}");
+
+		let track = relay.remote.track("video").unwrap();
+		let mut subscriber = tokio::time::timeout(TIMEOUT, track.subscribe(None))
+			.await
+			.expect("subscribe timeout")
+			.expect("subscribe");
+		let fetching = track.fetch_group(1, None);
+		// A spliced subscription registers its demand once polled, as a recorder's feed is.
+		assert!(subscriber.recv_group().now_or_never().is_none(), "{version}");
+
 		relay.track.write_frame(Timestamp::ZERO, &b"1"[..]).unwrap();
 		let mut group = tokio::time::timeout(TIMEOUT, fetching)
 			.await
