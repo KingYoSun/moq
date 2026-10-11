@@ -332,6 +332,11 @@ export class Parameters {
 		return this.#repeated.has(MSG_PARAM_TRACK_PROPERTY_FILTER);
 	}
 
+	/** Whether the message carried an AUTHORIZATION_TOKEN. */
+	get authorizationToken(): boolean {
+		return this.#repeated.has(MSG_PARAM_AUTHORIZATION_TOKEN);
+	}
+
 	// --- Numeric accessors ---
 
 	get subscriberPriority(): number | undefined {
