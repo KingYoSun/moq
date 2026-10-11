@@ -572,12 +572,13 @@ export class Publisher {
 			// the draft requires, so its count is final. The subscriber leaving cancels the
 			// ones still queued instead.
 			await race([Promise.all(groups), unsubscribed]);
-			// A refused update ends the subscription on our side while the requester still
-			// listens, so its open groups reset rather than finish as if complete, and
-			// PUBLISH_DONE still follows them.
-			if (publishError instanceof UpdateFailed) {
+			// An error of our own (a refused or malformed update, a failed track) ends the
+			// subscription while the requester may still listen, so its open streams reset
+			// rather than finish as if complete, and PUBLISH_DONE still follows them. A stream
+			// error is the requester cancelling, which the shortcut above already covers.
+			if (publishError && !(publishError instanceof StreamError)) {
 				track.close(publishError);
-				await Promise.all(groups);
+				await Promise.all([...groups, filling]);
 			}
 
 			// Draft 14 on has no end location in PUBLISH_DONE: an END_OF_TRACK object is what

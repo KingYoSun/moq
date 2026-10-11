@@ -2526,46 +2526,60 @@ test("PUBLISH_DONE waits for an update reply that is partly written", async () =
 	}
 });
 
-test("a refused update resets an open group instead of finishing it", async () => {
-	const fx = fixture();
-	const track = fx.broadcast.createTrack("video");
-	const { client } = await runSubscribe(
-		fx,
-		new Subscribe({ requestId: 7n, trackNamespace: Path.from("test"), trackName: "video", subscriberPriority: 0 }),
-	);
-	try {
-		const group = track.appendGroup();
-		group.writeFrame({ payload: new TextEncoder().encode("a"), timestamp: Timestamp.now() });
-		const uni = await fx.uni.read();
-		if (uni.done) throw new Error("no group");
-		const raw = uni.value.getReader();
-		await raw.read();
-		const params = new Parameters();
-		params.forward = false;
-		await sendSubscriptionUpdate(client, params, V20);
-		expect(await client.reader.u53()).toBe(RequestError.id);
-		await RequestError.decode(client.reader, V20);
-		expect(await client.reader.u53()).toBe(PublishDone.id);
-		expect((await PublishDone.decode(client.reader, V20)).statusCode).toBe(PublishDoneStatus.UPDATE_FAILED);
-		let ended = "open";
+for (const kind of ["refused", "malformed"] as const) {
+	test(`a ${kind} update resets an open group instead of finishing it`, async () => {
+		const fx = fixture();
+		const track = fx.broadcast.createTrack("video");
+		const { client } = await runSubscribe(
+			fx,
+			new Subscribe({
+				requestId: 7n,
+				trackNamespace: Path.from("test"),
+				trackName: "video",
+				subscriberPriority: 0,
+			}),
+		);
 		try {
-			for (;;) {
-				const next = await raw.read();
-				if (next.done) {
-					ended = "fin";
-					break;
-				}
+			const group = track.appendGroup();
+			group.writeFrame({ payload: new TextEncoder().encode("a"), timestamp: Timestamp.now() });
+			const uni = await fx.uni.read();
+			if (uni.done) throw new Error("no group");
+			const raw = uni.value.getReader();
+			await raw.read();
+			if (kind === "refused") {
+				const params = new Parameters();
+				params.forward = false;
+				await sendSubscriptionUpdate(client, params, V20);
+				expect(await client.reader.u53()).toBe(RequestError.id);
+				await RequestError.decode(client.reader, V20);
+			} else {
+				// Not REQUEST_UPDATE, the only message a requester may send here.
+				await client.writer.u53(0x03);
 			}
-		} catch {
-			ended = "reset";
+			expect(await client.reader.u53()).toBe(PublishDone.id);
+			expect((await PublishDone.decode(client.reader, V20)).statusCode).toBe(
+				kind === "refused" ? PublishDoneStatus.UPDATE_FAILED : PublishDoneStatus.INTERNAL_ERROR,
+			);
+			let ended = "open";
+			try {
+				for (;;) {
+					const next = await raw.read();
+					if (next.done) {
+						ended = "fin";
+						break;
+					}
+				}
+			} catch {
+				ended = "reset";
+			}
+			expect(ended).toBe("reset");
+		} finally {
+			track.close();
+			client.close();
+			fx.close();
 		}
-		expect(ended).toBe("reset");
-	} finally {
-		track.close();
-		client.close();
-		fx.close();
-	}
-});
+	});
+}
 
 for (const version of [
 	Version.DRAFT_16,
