@@ -529,7 +529,8 @@ macro_rules! encode_params {
 /// optional parameters (defaults to `None` when absent) and bare types like `u8`
 /// for parameters where `T::default()` is an acceptable fallback.
 ///
-/// Unknown parameters cause `DecodeError::InvalidValue`.
+/// Unknown parameters are ignored in drafts 14/15 and otherwise cause `DecodeError::InvalidValue`.
+/// A false `where` gate treats a declared key as unknown before decoding its value.
 /// Duplicate parameters cause `DecodeError::Duplicate`, unless the type allows a repeat
 /// (see [`Param::param_repeat`]), such as `Vec<T>`.
 ///
@@ -542,7 +543,7 @@ macro_rules! encode_params {
 /// let subscriber_priority = subscriber_priority.unwrap_or(128);
 /// ```
 macro_rules! decode_params {
-	($r:expr, $version:expr, $($key:expr => $name:ident: $ty:ty),* $(,)?) => {
+	($r:expr, $version:expr, $($key:expr => $name:ident: $ty:ty $(where $gate:expr)?),* $(,)?) => {
 		#[allow(unused)]
 		const _: () = {
 			let _keys: &[u64] = &[$($key),*];
@@ -588,7 +589,7 @@ macro_rules! decode_params {
 				// An if-chain rather than a `match`, so a key can be a named constant:
 				// the macro captures it as an expression, which is not a legal pattern.
 				$(
-					if _key == $key {
+					if _key == $key $( && ($gate) )? {
 						let _value = <$ty as $crate::ietf::Param>::param_decode($r, _version)?;
 						$name = Some(match $name.take() {
 							None => _value,
@@ -597,6 +598,16 @@ macro_rules! decode_params {
 						continue;
 					}
 				)*
+				// Drafts 14 and 15 use Key-Value-Pairs and require unknown ids to be ignored.
+				if matches!(_version, $crate::ietf::Version::Draft14 | $crate::ietf::Version::Draft15) {
+					if _key % 2 == 0 {
+						<u64 as $crate::coding::Decode<$crate::ietf::Version>>::decode($r, _version)?;
+					} else {
+						let _value = <Vec<u8> as $crate::coding::Decode<$crate::ietf::Version>>::decode($r, _version)?;
+						if _value.len() > (1 << 16) - 1 { return Err($crate::coding::DecodeError::BoundsExceeded); }
+					}
+					continue;
+				}
 				return Err($crate::coding::DecodeError::InvalidValue);
 			}
 		}
@@ -1117,10 +1128,33 @@ mod tests {
 				let _ = val;
 				Ok(())
 			})();
-			assert!(
-				matches!(result, Err(DecodeError::InvalidValue)),
-				"expected InvalidValue for unknown param in {version}"
-			);
+			if matches!(version, Version::Draft14 | Version::Draft15) {
+				result.unwrap();
+				assert!(!bytes.has_remaining());
+			} else {
+				assert!(matches!(result, Err(DecodeError::InvalidValue)), "{version}");
+			}
+		}
+	}
+
+	#[test]
+	fn legacy_unknown_parameter_is_ignored() {
+		for version in [Version::Draft14, Version::Draft15] {
+			for data in [
+				&[2, 0x3e, 1, 0x20, 7][..],
+				&[2, 0x3d, 1, 42, 0x20, 7][..],
+				// Unknown ids may repeat.
+				&[3, 0x3e, 1, 0x3e, 2, 0x20, 7][..],
+				&[3, 0x3d, 1, 42, 0x3d, 1, 43, 0x20, 7][..],
+			] {
+				let mut bytes = data;
+				let result: Result<Option<u8>, DecodeError> = (|| {
+					decode_params!(&mut bytes, version, 0x20 => priority: Option<u8>);
+					Ok(priority)
+				})();
+				assert_eq!(result.unwrap(), Some(7));
+				assert!(bytes.is_empty());
+			}
 		}
 	}
 
