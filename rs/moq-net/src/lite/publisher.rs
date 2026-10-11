@@ -2332,6 +2332,8 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
 		}
 		// Feed the full update into the model subscriber so the producer's
 		// aggregate reflects it (and a relay re-forwards it upstream).
+		// Read first: `update` replaces these preferences.
+		let requested = self.track.subscription().start;
 		let bounds = Bounds::from(&upd);
 		let _ = self.track.update(crate::track::Subscription {
 			priority: upd.priority,
@@ -2340,6 +2342,13 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
 		});
 		if let Some(start_group) = upd.start_group {
 			self.track.start_at(start_group);
+		} else if requested.is_some()
+			&& !self.ctx.version.resolves_start()
+			&& let Some(latest) = self.track.latest()
+		{
+			// Pre-06 an absent start means the latest group. `position_cursor` pins an
+			// unfloored SUBSCRIBE there, so an update that drops a named floor re-pins too.
+			self.track.start_at(latest);
 		}
 		self.track
 			.end_at(upd.end_group.map_or(Bound::Unbounded, Bound::Included));
@@ -3321,6 +3330,61 @@ mod serve_group_test {
 
 		// SUBSCRIBE_START at 0, then SUBSCRIBE_END at 3 with 2 streams.
 		assert_eq!(*log.writes.lock().unwrap(), [0, 1, 0, 1, 2, 3, 2]);
+	}
+
+	/// Pre-06 an absent Group Start is the latest group, so an update that drops a named
+	/// floor re-pins the cursor there: a group created below it afterwards is not served.
+	#[tokio::test]
+	async fn a_pre06_update_dropping_the_floor_repins_to_the_latest_group() {
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let subscriber = track.subscribe(
+			track::Subscription::default()
+				.with_start(track::Position::group(0))
+				.with_max_age(Duration::from_secs(60)),
+		);
+		let opens = Arc::<Opens>::default();
+		let track_priority = kio::Producer::new(0u8);
+		let ctx = Subscription {
+			session: SinkSession::new(Log::default()),
+			id: 0,
+			track_name: "test".into(),
+			priority: PriorityQueue::default(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 0,
+			version: Version::Lite05,
+			timescale: Some(crate::Timescale::default()),
+			opens: opens.clone(),
+		};
+		let bounds = Bounds {
+			start_group: Some(0),
+			start_frame: 0,
+			end_group: None,
+			end_frame: None,
+		};
+		let mut run = TrackRun::new(ctx, subscriber, bounds, track_priority);
+		let mut writer = Writer::new(SinkSend::new(Log::default()), Version::Lite05);
+		let mut settle = |run: &mut TrackRun<SinkSession>| {
+			let res = kio::wait(|waiter| run.poll(&mut writer, waiter)).now_or_never();
+			assert!(res.is_none(), "the run ended");
+			opens.opened.load(Ordering::Relaxed)
+		};
+
+		write_group(&mut track, 7, 7);
+		assert_eq!(settle(&mut run), 1);
+
+		run.update(lite::SubscribeUpdate {
+			priority: 0,
+			max_age: Duration::from_secs(60),
+			start_group: None,
+			end_group: None,
+			start_frame: 0,
+			end_frame: None,
+		});
+		write_group(&mut track, 5, 5);
+		assert_eq!(settle(&mut run), 1, "served a group below the latest");
+
+		write_group(&mut track, 8, 8);
+		assert_eq!(settle(&mut run), 2);
 	}
 
 	/// A lite-07 run over a relay's track, whose upstream subscription still waits on the
