@@ -2300,14 +2300,19 @@ impl<S: crate::transport::poll::Session> TrackRun<S> {
 		}
 		// Feed the full update into the model subscriber so the producer's
 		// aggregate reflects it (and a relay re-forwards it upstream).
+		let floored = self.track.subscription().start.is_some_and(|start| start.group > 0);
 		let bounds = Bounds::from(&upd);
 		let _ = self.track.update(crate::track::Subscription {
 			priority: upd.priority,
 			max_age: serving_max_age(self.ctx.version, upd.max_age),
 			..bounds.positions()
 		});
-		if let Some(start_group) = upd.start_group {
-			self.track.start_at(start_group);
+		// Clearing a resume floor must also expose a finished group below it.
+		// An unfloored cursor keeps its progress and never replays served groups.
+		match upd.start_group {
+			Some(start_group) => self.track.start_at(start_group),
+			None if floored && self.ctx.version.resolves_start() => self.track.start_at(0),
+			None => {}
 		}
 		self.track
 			.end_at(upd.end_group.map_or(Bound::Unbounded, Bound::Included));
@@ -3349,6 +3354,56 @@ mod serve_group_test {
 			let start = start.encode_bytes(Version::Lite07).unwrap();
 			self.session.log.writes.lock().unwrap().starts_with(&start)
 		}
+	}
+
+	/// A resume past the only finished group leaves that group below the cursor.
+	/// Widening to no floor serves it: it is the live edge until a newer group
+	/// exists, and a catalog never publishes the next one.
+	#[tokio::test(start_paused = true)]
+	async fn a_widening_update_serves_the_finished_group_it_had_skipped() {
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		write_group(&mut track, 0, 0);
+		let mut relay = RelayRun::new(&mut track, 1);
+		track.start_at(0).unwrap();
+		relay.settle();
+		assert_eq!(relay.opened(), 0, "the resume is past the only group");
+
+		relay.run.update(lite::SubscribeUpdate {
+			priority: 0,
+			max_age: Duration::from_secs(30),
+			start_group: None,
+			end_group: None,
+			start_frame: 0,
+			end_frame: None,
+		});
+		relay.settle();
+		assert_eq!(relay.opened(), 1, "the finished group is the live edge");
+	}
+
+	/// Widening the floor never rewinds past a group already served: group 0
+	/// arrived before the served groups, so the cursor has moved past it.
+	#[tokio::test(start_paused = true)]
+	async fn a_widening_update_does_not_rewind_past_served_groups() {
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		for sequence in 0..3 {
+			write_group(&mut track, sequence, sequence);
+		}
+		let mut relay = RelayRun::new(&mut track, 1);
+		relay.settle();
+		track.start_at(0).unwrap();
+		relay.settle();
+		assert_eq!(relay.opened(), 2, "groups 1 and 2 are at or above the floor");
+
+		relay.run.update(lite::SubscribeUpdate {
+			priority: 0,
+			max_age: Duration::from_secs(30),
+			start_group: None,
+			end_group: None,
+			start_frame: 0,
+			end_frame: None,
+		});
+		relay.settle();
+		assert_eq!(relay.opened(), 2, "group 0 was passed, not skipped");
 	}
 
 	/// A SUBSCRIBE_UPDATE landing while the first group waits on the source's start keeps
