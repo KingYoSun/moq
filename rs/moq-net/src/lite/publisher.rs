@@ -3336,16 +3336,8 @@ mod serve_group_test {
 		assert_eq!(*log.writes.lock().unwrap(), [0, 1, 0, 1, 2, 3, 2]);
 	}
 
-	/// Pre-06 an absent Group Start is the latest group, so an update that drops a named
-	/// floor re-pins the cursor there: a group created below it afterwards is not served.
-	#[tokio::test]
-	async fn a_pre06_update_dropping_the_floor_repins_to_the_latest_group() {
-		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
-		let subscriber = track.subscribe(
-			track::Subscription::default()
-				.with_start(track::Position::group(0))
-				.with_max_age(Duration::from_secs(60)),
-		);
+	/// A lite-05 subscription's run loop and its count of group streams opened.
+	fn lite05_run(track: track::Subscriber) -> (TrackRun<SinkSession>, Writer<SinkSend, Version>, Arc<Opens>) {
 		let opens = Arc::<Opens>::default();
 		let track_priority = kio::Producer::new(0u8);
 		let ctx = Subscription {
@@ -3365,8 +3357,21 @@ mod serve_group_test {
 			end_group: None,
 			end_frame: None,
 		};
-		let mut run = TrackRun::new(ctx, subscriber, bounds, track_priority);
-		let mut writer = Writer::new(SinkSend::new(Log::default()), Version::Lite05);
+		let writer = Writer::new(SinkSend::new(Log::default()), Version::Lite05);
+		(TrackRun::new(ctx, track, bounds, track_priority), writer, opens)
+	}
+
+	/// Pre-06 an absent Group Start is the latest group, so an update that drops a named
+	/// floor re-pins the cursor there: a group created below it afterwards is not served.
+	#[tokio::test]
+	async fn a_pre06_update_dropping_the_floor_repins_to_the_latest_group() {
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let subscriber = track.subscribe(
+			track::Subscription::default()
+				.with_start(track::Position::group(0))
+				.with_max_age(Duration::from_secs(60)),
+		);
+		let (mut run, mut writer, opens) = lite05_run(subscriber);
 		let mut settle = |run: &mut TrackRun<SinkSession>| {
 			let res = kio::wait(|waiter| run.poll(&mut writer, waiter)).now_or_never();
 			assert!(res.is_none(), "the run ended");
@@ -3389,6 +3394,32 @@ mod serve_group_test {
 
 		write_group(&mut track, 8, 8);
 		assert_eq!(settle(&mut run), 2);
+	}
+
+	/// On an empty track the re-pin has no latest group to name, so the first group the
+	/// track produces is served, even below the dropped floor.
+	#[tokio::test]
+	async fn a_pre06_update_dropping_the_floor_on_an_empty_track_serves_the_next_group() {
+		let mut track = track::Producer::new(Arc::new(broadcast::Info::default()), "test", None);
+		let subscriber = track.subscribe(
+			track::Subscription::default()
+				.with_start(track::Position::group(5))
+				.with_max_age(Duration::from_secs(60)),
+		);
+		let (mut run, mut writer, opens) = lite05_run(subscriber);
+		run.update(lite::SubscribeUpdate {
+			priority: 0,
+			max_age: Duration::from_secs(60),
+			start_group: None,
+			end_group: None,
+			start_frame: 0,
+			end_frame: None,
+		});
+
+		write_group(&mut track, 0, 0);
+		let res = kio::wait(|waiter| run.poll(&mut writer, waiter)).now_or_never();
+		assert!(res.is_none(), "the run ended");
+		assert_eq!(opens.opened.load(Ordering::Relaxed), 1, "group 0 was not served");
 	}
 
 	/// A lite-07 run over a relay's track, whose upstream subscription still waits on the
