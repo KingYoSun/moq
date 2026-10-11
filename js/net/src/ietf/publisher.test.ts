@@ -2406,7 +2406,7 @@ for (const version of [
 	Version.DRAFT_21,
 	Version.DRAFT_22,
 ]) {
-	for (const field of ["filter", "largest"] as const) {
+	for (const field of ["filter", "largest", "token"] as const) {
 		test(`unsupported subscription update ${field} is refused in ${version}`, async () => {
 			const fx = fixture(version);
 			const track = fx.broadcast.createTrack("video");
@@ -2422,7 +2422,9 @@ for (const version of [
 			try {
 				const params = new Parameters();
 				if (field === "filter") params.subscriptionFilter = { kind: "nextObject" };
-				else params.largest = { groupId: 1n, objectId: 0n };
+				else if (field === "largest") params.largest = { groupId: 1n, objectId: 0n };
+				// AUTHORIZATION_TOKEN, which only decodes as a repeatable parameter.
+				else params.bytes.set(0x03n, new Uint8Array([1]));
 				await sendSubscriptionUpdate(client, params, version);
 				expect(await client.reader.u53()).toBe(RequestError.id);
 				expect((await RequestError.decode(client.reader, version)).errorCode).toBe(
@@ -2517,6 +2519,47 @@ test("PUBLISH_DONE waits for an update reply that is partly written", async () =
 		expect(await client.reader.u53()).toBe(PublishDone.id);
 		expect((await PublishDone.decode(client.reader, V20)).statusCode).toBe(PublishDoneStatus.TRACK_ENDED);
 		await serving;
+	} finally {
+		track.close();
+		client.close();
+		fx.close();
+	}
+});
+
+test("a refused update resets an open group instead of finishing it", async () => {
+	const fx = fixture();
+	const track = fx.broadcast.createTrack("video");
+	const { client } = await runSubscribe(
+		fx,
+		new Subscribe({ requestId: 7n, trackNamespace: Path.from("test"), trackName: "video", subscriberPriority: 0 }),
+	);
+	try {
+		const group = track.appendGroup();
+		group.writeFrame({ payload: new TextEncoder().encode("a"), timestamp: Timestamp.now() });
+		const uni = await fx.uni.read();
+		if (uni.done) throw new Error("no group");
+		const raw = uni.value.getReader();
+		await raw.read();
+		const params = new Parameters();
+		params.forward = false;
+		await sendSubscriptionUpdate(client, params, V20);
+		expect(await client.reader.u53()).toBe(RequestError.id);
+		await RequestError.decode(client.reader, V20);
+		expect(await client.reader.u53()).toBe(PublishDone.id);
+		expect((await PublishDone.decode(client.reader, V20)).statusCode).toBe(PublishDoneStatus.UPDATE_FAILED);
+		let ended = "open";
+		try {
+			for (;;) {
+				const next = await raw.read();
+				if (next.done) {
+					ended = "fin";
+					break;
+				}
+			}
+		} catch {
+			ended = "reset";
+		}
+		expect(ended).toBe("reset");
 	} finally {
 		track.close();
 		client.close();

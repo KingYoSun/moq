@@ -468,6 +468,7 @@ export class Publisher {
 						params.largest !== undefined ||
 						params.rangeFilters ||
 						params.trackPropertyFilter ||
+						params.authorizationToken ||
 						[...params.vars.keys()].some((key) => key !== 0x10n && key !== 0x20n);
 					if (unsupported) {
 						// Recorded before the reply, so a PUBLISH_DONE queued behind it reports the failure.
@@ -571,6 +572,13 @@ export class Publisher {
 			// the draft requires, so its count is final. The subscriber leaving cancels the
 			// ones still queued instead.
 			await race([Promise.all(groups), unsubscribed]);
+			// A refused update ends the subscription on our side while the requester still
+			// listens, so its open groups reset rather than finish as if complete, and
+			// PUBLISH_DONE still follows them.
+			if (publishError instanceof UpdateFailed) {
+				track.close(publishError);
+				await Promise.all(groups);
+			}
 
 			// Draft 14 on has no end location in PUBLISH_DONE: an END_OF_TRACK object is what
 			// tells the subscriber where the track ended.
