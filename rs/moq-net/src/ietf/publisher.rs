@@ -1382,10 +1382,11 @@ where
 		// The subscriber cancelling is the only other way this ends early, and is owed
 		// nothing.
 		let group = {
+			let mut finished = false;
 			let mut read = std::pin::pin!(read_fetch(&track, start.group, start.object, until, priority));
 			kio::wait(|waiter| {
 				let mut cx = std::task::Context::from_waker(waiter.waker());
-				if stream.reader.poll_closed(&mut cx).is_ready() {
+				if super::request_stream::poll_cancel(&mut stream, &mut finished, self.version, &mut cx).is_ready() {
 					return Poll::Ready(None);
 				}
 				waiter.poll_future(read.as_mut()).map(Some)
@@ -1488,13 +1489,11 @@ where
 		// the lifetime of a request whose subscription never arrives or resolves.
 		let joined = {
 			let mut pending = false;
+			let mut finished = false;
 			let mut deadline = crate::runtime::Deadline::after(&self.runtime, Duration::from_secs(10));
 			kio::wait(|waiter| {
 				let mut cx = std::task::Context::from_waker(waiter.waker());
-				// The request reader is what the subscriber FINs or resets. The writer
-				// on a draft-14-16 virtual stream reports closed immediately, which is
-				// not a cancellation.
-				if stream.reader.poll_closed(&mut cx).is_ready() {
+				if super::request_stream::poll_cancel(stream, &mut finished, self.version, &mut cx).is_ready() {
 					return Poll::Ready(Err(Error::Cancel));
 				}
 				let joins = self.joins.poll(waiter, |joins| match joins.get(&subscribe_id) {
@@ -4672,6 +4671,68 @@ mod serve_tests {
 				group.finish().unwrap();
 				assert!(!drive(run.as_mut()).await, "{version}");
 				assert_eq!(occurrences(&h.log, b"after FIN"), 1, "{version}");
+			}
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn requester_fin_is_version_gated_for_fetches() {
+		for version in ALL_VERSIONS.into_iter().filter(|v| !Filter::is_draft20(*v)) {
+			for joining in [false, true] {
+				for reset in [false, true] {
+					let mut h = serve(version);
+					publish_pairs(&mut h, 1, None);
+					settle().await;
+					let requester = if reset {
+						ScriptedSession::per_stream_reset(vec![vec![]])
+					} else {
+						ScriptedSession::per_stream_eof(vec![vec![]])
+					};
+					let stream = Stream::open(&mut requester.clone(), version).await.unwrap();
+					if joining {
+						h.publisher.joins.lock().insert(
+							RequestId(REQUEST_ID),
+							Some(Joined::Group {
+								end: Location { group: 0, object: 2 },
+								cache: h.track.consume(),
+								timescale: None,
+							}),
+						);
+					}
+					let fetch_type = if joining {
+						FetchType::RelativeJoining {
+							subscriber_request_id: RequestId(REQUEST_ID),
+							group_offset: 0,
+						}
+					} else {
+						FetchType::Standalone {
+							namespace: crate::Path::new("room"),
+							track: "video".into(),
+							start: Location { group: 0, object: 0 },
+							end: Location { group: 0, object: 2 },
+						}
+					};
+					let _ = h
+						.publisher
+						.clone()
+						.run_fetch_stream(
+							stream,
+							ietf::Fetch {
+								request_id: FETCH_ID,
+								subscriber_priority: 128,
+								group_order: GroupOrder::Ascending,
+								fetch_type,
+								range_filters: false,
+								fill_timeout: false,
+							},
+						)
+						.await;
+					assert_eq!(
+						occurrences(&h.log, b"0-0"),
+						usize::from(!reset && !fin_cancels(version)),
+						"{version}, joining={joining}, reset={reset}"
+					);
+				}
 			}
 		}
 	}
