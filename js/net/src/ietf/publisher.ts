@@ -434,6 +434,19 @@ export class Publisher {
 			const unsubscribed = new Promise<void>((resolve) => {
 				unsubscribe = resolve;
 			});
+
+			// Update replies and PUBLISH_DONE come from separate tasks but share this stream, and a
+			// message is written in several pieces. Chain them so each goes out whole, in order,
+			// and nothing follows PUBLISH_DONE.
+			let replies: Promise<void> = Promise.resolve();
+			let replied = false;
+			const reply = (write: () => Promise<void>): Promise<void> => {
+				const sent = replies.then(() => (replied ? undefined : write()));
+				replies = sent.catch(() => undefined);
+				return sent;
+			};
+			let publishError: Error | undefined;
+
 			const updates = (async () => {
 				if (version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16)
 					return stream.reader.closed;
@@ -457,26 +470,32 @@ export class Publisher {
 						params.trackPropertyFilter ||
 						[...params.vars.keys()].some((key) => key !== 0x10n && key !== 0x20n);
 					if (unsupported) {
-						await stream.writer.u53(RequestError.id);
-						await new RequestError({
-							requestId: undefined,
-							errorCode: toRequestCode("not_supported", "subscribe", version),
-							reasonPhrase: "REQUEST_UPDATE parameters not supported",
-						}).encode(stream.writer, version);
-						throw new UpdateFailed();
+						// Recorded before the reply, so a PUBLISH_DONE queued behind it reports the failure.
+						const failed = new UpdateFailed();
+						publishError = failed;
+						await reply(async () => {
+							await stream.writer.u53(RequestError.id);
+							await new RequestError({
+								requestId: undefined,
+								errorCode: toRequestCode("not_supported", "subscribe", version),
+								reasonPhrase: "REQUEST_UPDATE parameters not supported",
+							}).encode(stream.writer, version);
+						});
+						throw failed;
 					}
 					// update() replaces every option, so carry the rest over as Rust does.
 					if (params.subscriberPriority !== undefined)
 						track.update({ ...track.subscription.peek(), priority: fromWire(params.subscriberPriority) });
-					await stream.writer.u53(RequestOk.id);
-					await new RequestOk({ requestId: undefined }).encode(stream.writer, version);
+					await reply(async () => {
+						await stream.writer.u53(RequestOk.id);
+						await new RequestOk({ requestId: undefined }).encode(stream.writer, version);
+					});
 				}
 			})();
 			const requestEnded =
 				version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16
 					? updates
 					: race([updates, stream.writer.closed]);
-			let publishError: Error | undefined;
 			void requestEnded.then(
 				() => {
 					if (!finished) unsubscribe();
@@ -574,27 +593,30 @@ export class Publisher {
 			// PUBLISH_DONE is required for every supported draft. The peer may have already
 			// closed its side to unsubscribe, in which case there is nowhere to send it.
 			try {
-				await stream.writer.u53(PublishDone.id);
-				const done = new PublishDone({
-					requestId:
-						version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16
-							? msg.requestId
-							: undefined,
-					statusCode:
-						publishError instanceof UpdateFailed
-							? PublishDoneStatus.UPDATE_FAILED
-							: publishError
-								? PublishDoneStatus.INTERNAL_ERROR
-								: PublishDoneStatus.TRACK_ENDED,
-					streamCount: BigInt(streams.opened),
-					reasonPhrase:
-						publishError instanceof UpdateFailed
-							? "update failed"
-							: publishError
-								? "internal error"
-								: "track ended",
+				await reply(async () => {
+					replied = true;
+					await stream.writer.u53(PublishDone.id);
+					const done = new PublishDone({
+						requestId:
+							version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16
+								? msg.requestId
+								: undefined,
+						statusCode:
+							publishError instanceof UpdateFailed
+								? PublishDoneStatus.UPDATE_FAILED
+								: publishError
+									? PublishDoneStatus.INTERNAL_ERROR
+									: PublishDoneStatus.TRACK_ENDED,
+						streamCount: BigInt(streams.opened),
+						reasonPhrase:
+							publishError instanceof UpdateFailed
+								? "update failed"
+								: publishError
+									? "internal error"
+									: "track ended",
+					});
+					await done.encode(stream.writer, version);
 				});
-				await done.encode(stream.writer, version);
 			} catch {
 				// Stream might already be closed by peer.
 			}

@@ -2477,6 +2477,53 @@ test("unsupported subscription update remains UPDATE_FAILED while the last group
 	}
 });
 
+test("PUBLISH_DONE waits for an update reply that is partly written", async () => {
+	const fx = fixture();
+	const track = fx.broadcast.createTrack("video");
+	const client = await Stream.open(fx.pair.client, { version: V20 });
+	const server = await Stream.accept(fx.pair.server, V20);
+	if (!server) throw new Error("missing stream");
+	const serving = fx.pub.runSubscribe(
+		new Subscribe({ requestId: 7n, trackNamespace: Path.from("test"), trackName: "video", subscriberPriority: 0 }),
+		server,
+	);
+	try {
+		expect(await client.reader.u53()).toBe(SubscribeOk.id);
+		await SubscribeOk.decode(client.reader, V20);
+
+		// Hold the REQUEST_OK after its type, before its length and body.
+		const paused = Promise.withResolvers<void>();
+		const resume = Promise.withResolvers<void>();
+		const write = server.writer.write.bind(server.writer);
+		let writes = 0;
+		server.writer.write = async (v: Uint8Array) => {
+			if (++writes === 2) {
+				paused.resolve();
+				await resume.promise;
+			}
+			await write(v);
+		};
+
+		const params = new Parameters();
+		params.subscriberPriority = 1;
+		await sendSubscriptionUpdate(client, params, V20);
+		await paused.promise;
+		track.close();
+		await flush();
+		resume.resolve();
+
+		expect(await client.reader.u53()).toBe(RequestOk.id);
+		await RequestOk.decode(client.reader, V20);
+		expect(await client.reader.u53()).toBe(PublishDone.id);
+		expect((await PublishDone.decode(client.reader, V20)).statusCode).toBe(PublishDoneStatus.TRACK_ENDED);
+		await serving;
+	} finally {
+		track.close();
+		client.close();
+		fx.close();
+	}
+});
+
 for (const version of [
 	Version.DRAFT_16,
 	Version.DRAFT_17,
