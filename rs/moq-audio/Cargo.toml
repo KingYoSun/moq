@@ -78,10 +78,10 @@ cpal = { version = "0.18", optional = true }
 # is the ring buffer and `resampler` its rubato back end; the default
 # `fft-resampler` stays off, matching the sinc-only stance below.
 fixed-resample = { version = "0.13", optional = true, default-features = false, features = ["channel", "resampler"] }
-hang = { workspace = true }
-kio = { workspace = true, optional = true }
-moq-mux = { workspace = true }
-moq-net = { workspace = true }
+hang = "0.21.12"
+kio = { version = "0.6.2", optional = true }
+moq-mux = "0.10.12"
+moq-net = "0.3.11"
 # We only use the sinc resampler (Async::new_sinc), so skip the default
 # fft_resampler feature and its RustFFT/realfft dependencies.
 rand = { workspace = true }

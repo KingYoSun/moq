@@ -591,7 +591,10 @@ impl Reference {
 			return false;
 		}
 
-		let (prod, cons) = channel(rate);
+		let (prod, mut cons) = channel(rate);
+		// fixed-resample drops every push until the consumer has read once, and the canceller only reads
+		// once frames are available, so prime it with an empty read.
+		cons.read_interleaved(&mut [], false);
 		self.state.lock().unwrap().reference = Some(cons);
 		self.pending = Some(prod);
 		true
