@@ -7,7 +7,7 @@
 //! lagging rendition is marked in the catalog. [`Reorder`] is what a sequence header declares about
 //! frame reordering, read by the exporters that author a decode clock.
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use hang::catalog::stalled::{Detector, Sample};
 

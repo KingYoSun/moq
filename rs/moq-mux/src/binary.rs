@@ -63,7 +63,7 @@
 //! ```
 
 use std::marker::PhantomData;
-use std::time::Instant;
+use web_time::Instant;
 
 use bytes::Bytes;
 use moq_net::Timed;
@@ -434,7 +434,7 @@ mod test {
 			.binary_stream(track(&mut broadcast, "bare"), Config::default())
 			.unwrap();
 
-		let anchor = std::time::Instant::now();
+		let anchor = web_time::Instant::now();
 		for i in 0..20u64 {
 			let now = moq_net::Timestamp::from_micros(i * 100_000).unwrap();
 			let at = |late: u64| anchor + std::time::Duration::from_millis(i * 100 + late);
@@ -468,13 +468,13 @@ mod test {
 			.binary_stream(track(&mut broadcast, "telemetry"), Config::default())
 			.unwrap();
 
-		let captured = std::time::Instant::now();
+		let captured = web_time::Instant::now();
 		telemetry.append(Timed::from(&b"now"[..]).at(captured)).unwrap();
 		let late = captured - std::time::Duration::from_secs(1);
 		telemetry.append(Timed::from(&b"late"[..]).at(late)).unwrap();
 
 		// A capture ahead of now is refused before anything is written.
-		let ahead = std::time::Instant::now() + std::time::Duration::from_secs(1);
+		let ahead = web_time::Instant::now() + std::time::Duration::from_secs(1);
 		assert!(matches!(
 			telemetry.append(Timed::from(&b"ahead"[..]).at(ahead)),
 			Err(crate::Error::InvalidCapture)
@@ -497,7 +497,7 @@ mod test {
 		let before = catalog.clock().now();
 		telemetry.append(&b"untimed"[..]).unwrap();
 		telemetry
-			.append(Timed::from(&b"timed"[..]).at(std::time::Instant::now()))
+			.append(Timed::from(&b"timed"[..]).at(web_time::Instant::now()))
 			.unwrap();
 		let after = catalog.clock().now();
 
@@ -777,7 +777,7 @@ mod test {
 				.unwrap();
 
 			let listing = telemetry.listing.as_mut().unwrap();
-			let anchor = std::time::Instant::now();
+			let anchor = web_time::Instant::now();
 			for i in 0..60u64 {
 				let now = moq_net::Timestamp::from_micros(i * 40_000).unwrap();
 				// Every other payload reaches the transport 10ms later than the rest.

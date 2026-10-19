@@ -80,7 +80,7 @@ impl Listing {
 	/// broadcast clock if known.
 	pub(crate) fn record(&mut self, bytes: usize, captured: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		let now = self.rendition.timestamp()?;
-		let flush = captured.map(|captured| (captured, std::time::Instant::now()));
+		let flush = captured.map(|captured| (captured, web_time::Instant::now()));
 		self.record_at(now, bytes, flush)
 	}
 
@@ -90,7 +90,7 @@ impl Listing {
 		&mut self,
 		now: moq_net::Timestamp,
 		bytes: usize,
-		flush: Option<(moq_net::Timestamp, std::time::Instant)>,
+		flush: Option<(moq_net::Timestamp, web_time::Instant)>,
 	) -> crate::Result<()> {
 		// Each write is its own span, closed by the next one.
 		self.estimator.cut(Some(now));
