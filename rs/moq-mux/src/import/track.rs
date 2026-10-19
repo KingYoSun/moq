@@ -386,7 +386,7 @@ impl Track {
 
 	/// Record a locally encoded frame's transport handoff. Call this only for an original
 	/// encoder; file, pipe, and network imports must leave the clock out of the estimate.
-	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: std::time::Instant) -> Result<()> {
+	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: web_time::Instant) -> Result<()> {
 		match self.kind {
 			TrackKind::Avc3 { ref mut import, .. } | TrackKind::Avc1 { ref mut import, .. } => {
 				import.flush(timestamp, now)
@@ -1033,7 +1033,7 @@ mod tests {
 		let (mut broadcast, catalog) = new_broadcast();
 		let (import, subscriber) = opus_import(&mut broadcast, &catalog);
 		let mut import: Track = import.into();
-		let anchor = std::time::Instant::now();
+		let anchor = web_time::Instant::now();
 		for (pts, arrival) in [(0, 0), (20, 120)] {
 			let timestamp = Timestamp::from_micros(pts * 1_000).unwrap();
 			import.decode(b"a", Some(timestamp)).unwrap();

@@ -340,7 +340,7 @@ mod test {
 	async fn every_program_publishes_its_own_broadcast() {
 		let origin = crate::source::produce_origin();
 		let ago = Duration::from_secs(60);
-		let clock = crate::Clock::at(std::time::Instant::now() - ago, std::time::SystemTime::now() - ago).unwrap();
+		let clock = crate::Clock::at(web_time::Instant::now() - ago, web_time::SystemTime::now() - ago).unwrap();
 		let config = catalog::Config::default().with_clock(clock);
 		let mut programs = Programs::new(origin.clone(), "event.hang", config).live();
 

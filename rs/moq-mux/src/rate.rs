@@ -4,7 +4,7 @@
 //! rate a sender should produce, so audio, video, and transcode back off the
 //! same way.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use moq_net::bandwidth;
 

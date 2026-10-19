@@ -67,7 +67,7 @@
 //! ```
 
 use std::marker::PhantomData;
-use std::time::Instant;
+use web_time::Instant;
 
 use moq_net::Timed;
 use serde::Serialize;
@@ -666,7 +666,7 @@ mod test {
 		let mut status = catalog
 			.json_snapshot::<Value>(track(&mut broadcast, "status"), Config::default())
 			.unwrap();
-		let now = std::time::Instant::now();
+		let now = web_time::Instant::now();
 		let value = serde_json::json!({ "armed": true });
 		status.update(Timed::from(&value).at(now)).unwrap();
 		let stale = now - std::time::Duration::from_secs(1);

@@ -1365,9 +1365,9 @@ async fn live_import_rewrites_tfdt_onto_the_broadcast_clock() {
 	let input = [live_session(3_600_000_000, 20)];
 	let ago = std::time::Duration::from_secs(30);
 	let verbatim = live_import(&input, false, ago, std::time::Duration::ZERO).await;
-	let wall_before = std::time::SystemTime::now();
+	let wall_before = web_time::SystemTime::now();
 	let live = live_import(&input, true, ago, std::time::Duration::ZERO).await;
-	let wall_after = std::time::SystemTime::now();
+	let wall_after = web_time::SystemTime::now();
 
 	crate::container::test_util::common_offset(&verbatim.published, &live.published);
 	let first = live.published[&live.video][0];
