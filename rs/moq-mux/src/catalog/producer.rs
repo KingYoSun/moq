@@ -1268,12 +1268,12 @@ mod test {
 
 	#[test]
 	fn with_clock_names_the_contents_real_start() {
-		use std::time::{Duration, SystemTime};
+		use web_time::{Duration, SystemTime};
 
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let wall = SystemTime::UNIX_EPOCH + Duration::from_millis(hang::catalog::MOQ_EPOCH_UNIX_MILLIS + 60_000);
 		let config = Config::default()
-			.with_clock(crate::Clock::at(std::time::Instant::now(), wall).expect("a representable wall"));
+			.with_clock(crate::Clock::at(web_time::Instant::now(), wall).expect("a representable wall"));
 		let catalog = Producer::new(&mut broadcast, config).unwrap();
 
 		// A recording import advertises the content's start, not the construction instant.

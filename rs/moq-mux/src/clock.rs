@@ -19,7 +19,7 @@
 //! A source that muxes several tracks (an MPEG-TS program, an fMP4 file) shares one [`Anchor`]
 //! across them, with one [`Lane`] per track, so every track keeps the same offset.
 
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant, SystemTime};
 
 use hang::catalog::{MAX_SAFE_INTEGER, MOQ_EPOCH_UNIX_MILLIS};
 

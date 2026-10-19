@@ -229,7 +229,7 @@ where
 
 	/// Record when a locally encoded frame reached the transport. Imported media must leave
 	/// this clock observation out and rely on its container batch and reorder measurements.
-	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: std::time::Instant) -> crate::Result<()> {
+	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: web_time::Instant) -> crate::Result<()> {
 		self.estimator.flush(timestamp, now);
 		self.publish_estimate()
 	}
@@ -810,7 +810,7 @@ mod tests {
 			tracks.push(track);
 		}
 
-		let anchor = std::time::Instant::now();
+		let anchor = web_time::Instant::now();
 		let ms = std::time::Duration::from_millis;
 		let pts = |millis: u64| Timestamp::from_micros(millis * 1_000).unwrap();
 		tracks[0].flush(pts(0), anchor).unwrap();

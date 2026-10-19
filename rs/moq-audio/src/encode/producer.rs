@@ -1,6 +1,6 @@
 //! Encode raw PCM and publish it as a moq audio track.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use bytes::Bytes;
 

@@ -13,19 +13,21 @@ keywords = ["quic", "http3", "webtransport", "media", "live"]
 categories = ["multimedia", "network-programming", "web-programming"]
 
 [dependencies]
+# The published hang and moq crates (the same versions as the workspace), so a git dependency on this crate
+# shares them with crates.io dependents (kukuri pins this commit with [patch.crates-io]).
 anyhow = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 crc = "3"
 h264-parser = { version = "0.4.2" }
-hang = { workspace = true }
-kio = { workspace = true }
+hang = "0.21.12"
+kio = "0.6.2"
 memchr = "2"
-moq-binary = { workspace = true }
-moq-json = { workspace = true }
-moq-loc = { workspace = true }
-moq-msf = { workspace = true }
-moq-net = { workspace = true }
+moq-binary = "0.1.11"
+moq-json = "0.5.9"
+moq-loc = "0.2.20"
+moq-msf = "0.5.1"
+moq-net = "0.3.11"
 mp4-atom = { version = "0.15", features = ["tokio", "bytes", "serde"] }
 mpeg2ts = "0.6.0"
 num_enum = { workspace = true }
@@ -39,6 +41,8 @@ tokio = { workspace = true, features = ["macros"] }
 tracing = { workspace = true }
 url = { workspace = true }
 web-async = { workspace = true }
+# The browser (wasm) has no std clock: Instant and SystemTime come from web-time there (std on native).
+web-time = "1.1"
 webm-iterable = "0.7"
 
 [dev-dependencies]

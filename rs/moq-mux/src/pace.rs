@@ -1,6 +1,6 @@
 //! Pacing of media frames onto the wall clock.
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use moq_net::Timestamp;
 

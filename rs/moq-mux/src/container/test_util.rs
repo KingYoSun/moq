@@ -131,7 +131,7 @@ pub(crate) fn raw_frame(timestamp_us: u64, payload: &'static [u8], keyframe: boo
 
 /// A broadcast clock that began `ago` before now, so a first frame arriving now reads as late.
 pub(crate) fn late_clock(ago: std::time::Duration) -> crate::Clock {
-	crate::Clock::at(std::time::Instant::now() - ago, std::time::SystemTime::now() - ago).unwrap()
+	crate::Clock::at(web_time::Instant::now() - ago, web_time::SystemTime::now() - ago).unwrap()
 }
 
 /// Every frame timestamp, in micros, that each media rendition in `catalog` published, by track.

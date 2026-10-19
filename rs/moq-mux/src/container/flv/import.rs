@@ -21,7 +21,7 @@
 //! enhanced audio, and any other codec, are logged and dropped.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use anyhow::Context;
 use bytes::{Buf, Bytes, BytesMut};
