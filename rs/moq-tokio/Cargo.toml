@@ -65,8 +65,10 @@ hmac = { workspace = true, optional = true }
 humantime = "2.3"
 mdns-sd = { workspace = true, optional = true }
 
-moq-net = { workspace = true }
-moq-sock = { workspace = true }
+# The published moq-net and moq-sock (the same versions as the workspace), so a git dependency on
+# this crate shares them with crates.io dependents (kukuri pins this commit with [patch.crates-io]).
+moq-net = "0.3.11"
+moq-sock = "0.2.0"
 # iroh runs on upstream noq, not the moq-noq fork, and re-exports only the
 # ControllerFactory trait, not the concrete congestion configs. Version matched to
 # the copy iroh pulls in.
