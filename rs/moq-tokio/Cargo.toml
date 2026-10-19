@@ -49,10 +49,17 @@ android-logcat = ["dep:tracing-android"]
 
 [dependencies]
 bytes = "1"
+futures = "0.3"
+# The poll adapter (`transport`) lingers on tokio natively and on the page's event loop in the
+# browser (wasm), whose build has only that module.
+web-async = { workspace = true }
+web-transport-trait = { workspace = true }
+
+# Every module but `transport` needs sockets, files, or tokio's `full`.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 # Family-restricted `getaddrinfo`, so the AAAA and A queries can be issued separately
 # (RFC 8305 section 3) while still going through the system resolver.
 dns-lookup = { version = "4", optional = true }
-futures = "0.3"
 hex = { workspace = true }
 hmac = { workspace = true, optional = true }
 humantime = "2.3"
@@ -90,7 +97,6 @@ usage = { workspace = true, features = ["config"] }
 web-transport-iroh = { workspace = true, optional = true }
 web-transport-moq = { workspace = true, optional = true }
 web-transport-proto = { workspace = true, optional = true }
-web-transport-trait = { workspace = true }
 x509-parser = "0.18"
 
 [target.'cfg(target_os = "android")'.dependencies]
