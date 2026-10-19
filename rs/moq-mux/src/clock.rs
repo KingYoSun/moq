@@ -187,7 +187,8 @@ impl Clock {
 	///
 	/// Pure in the stored epoch: a system-clock adjustment after construction changes nothing.
 	/// Refuses an unrepresentable result rather than truncating it, and a clock without a mapping.
-	pub fn wall_clock(&self, pts: moq_net::Timestamp) -> crate::Result<SystemTime> {
+	// hang names the wall clock in std's type (it only converts; it never reads the clock).
+	pub fn wall_clock(&self, pts: moq_net::Timestamp) -> crate::Result<std::time::SystemTime> {
 		let wall = self
 			.wall
 			.ok_or_else(|| crate::Error::UnmappableTimestamp("the host wall clock was unset".to_string()))?;
