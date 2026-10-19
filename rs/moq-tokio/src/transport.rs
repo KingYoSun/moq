@@ -8,6 +8,7 @@
 //! [`Session`]), so a backend that implements the poll interface itself is
 //! handed to moq-net directly.
 
+use std::future::Future;
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
@@ -15,8 +16,44 @@ use futures::FutureExt;
 use web_transport_trait::poll as wt_poll;
 
 /// A stored in-flight operation future. Native transports are Send, so the
-/// plain boxed flavor suffices.
+/// plain boxed flavor suffices; the browser's (wasm) are not.
+#[cfg(not(target_family = "wasm"))]
 type OpBox<T> = futures::future::BoxFuture<'static, T>;
+#[cfg(target_family = "wasm")]
+type OpBox<T> = futures::future::LocalBoxFuture<'static, T>;
+
+/// Boxes an operation future as [`OpBox`].
+trait Op: Future + Sized + 'static {
+	fn op(self) -> OpBox<Self::Output>;
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl<F: Future + Send + 'static> Op for F {
+	fn op(self) -> OpBox<Self::Output> {
+		self.boxed()
+	}
+}
+
+#[cfg(target_family = "wasm")]
+impl<F: Future + 'static> Op for F {
+	fn op(self) -> OpBox<Self::Output> {
+		self.boxed_local()
+	}
+}
+
+/// Finishes `task` after its owner is gone: on the tokio runtime natively (without one,
+/// the backend's drop behavior stands), on the page's event loop in the browser (wasm).
+#[cfg(not(target_family = "wasm"))]
+fn linger(task: impl Future<Output = ()> + Send + 'static) {
+	if let Ok(handle) = tokio::runtime::Handle::try_current() {
+		handle.spawn(task);
+	}
+}
+
+#[cfg(target_family = "wasm")]
+fn linger(task: impl Future<Output = ()> + 'static) {
+	web_async::spawn(task);
+}
 
 /// The longest [`Session::close`] keeps a handle to the backend while it
 /// finishes closing. web-transport-moq force-closes after max(3 RTT, 100ms), so
@@ -129,7 +166,7 @@ where
 		let session = &self.session;
 		poll_op(&mut self.accept_uni, cx, || {
 			let session = session.clone();
-			async move { session.accept_uni().await }.boxed()
+			async move { session.accept_uni().await }.op()
 		})
 		.map(|res| res.map(RecvStream::new))
 	}
@@ -138,7 +175,7 @@ where
 		let session = &self.session;
 		poll_op(&mut self.accept_bi, cx, || {
 			let session = session.clone();
-			async move { session.accept_bi().await }.boxed()
+			async move { session.accept_bi().await }.op()
 		})
 		.map(|res| res.map(|(send, recv)| (SendStream::new(send), RecvStream::new(recv))))
 	}
@@ -147,7 +184,7 @@ where
 		let session = &self.session;
 		poll_op(&mut self.open_uni, cx, || {
 			let session = session.clone();
-			async move { session.open_uni().await }.boxed()
+			async move { session.open_uni().await }.op()
 		})
 		.map(|res| res.map(SendStream::new))
 	}
@@ -156,7 +193,7 @@ where
 		let session = &self.session;
 		poll_op(&mut self.open_bi, cx, || {
 			let session = session.clone();
-			async move { session.open_bi().await }.boxed()
+			async move { session.open_bi().await }.op()
 		})
 		.map(|res| res.map(|(send, recv)| (SendStream::new(send), RecvStream::new(recv))))
 	}
@@ -171,7 +208,7 @@ where
 		let session = &self.session;
 		poll_op(&mut self.recv_datagram, cx, || {
 			let session = session.clone();
-			async move { session.recv_datagram().await }.boxed()
+			async move { session.recv_datagram().await }.op()
 		})
 	}
 
@@ -191,19 +228,17 @@ where
 		// session. Dropping the last handle would FIN them alongside the capsule,
 		// a connection error under RFC 9114, and the browser would lose the code
 		// and reason. Keep a handle until the connection is gone.
-		if let Ok(handle) = tokio::runtime::Handle::try_current() {
-			let session = self.session.clone();
-			handle.spawn(async move {
-				let _ = tokio::time::timeout(CLOSE_LINGER, session.closed()).await;
-			});
-		}
+		let session = self.session.clone();
+		linger(async move {
+			let _ = web_async::time::timeout(CLOSE_LINGER, session.closed()).await;
+		});
 	}
 
 	fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error> {
 		let session = &self.session;
 		poll_op(&mut self.closed, cx, || {
 			let session = session.clone();
-			async move { session.closed().await }.boxed()
+			async move { session.closed().await }.op()
 		})
 	}
 
@@ -339,7 +374,7 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 						};
 						(stream, res)
 					}
-					.boxed();
+					.op();
 					*self.state.get_mut().unwrap() = Some(SendState::Writing { fut, chunk: retained });
 				}
 				SendState::Writing { mut fut, chunk } => match fut.as_mut().poll(cx) {
@@ -452,7 +487,7 @@ impl<S: web_transport_trait::SendStream + 'static> wt_poll::SendStream for SendS
 						};
 						(stream, res)
 					}
-					.boxed();
+					.op();
 					*self.state.get_mut().unwrap() = Some(SendState::Closing(fut));
 				}
 				SendState::Writing { mut fut, chunk } => match fut.as_mut().poll(cx) {
@@ -520,10 +555,8 @@ impl<S: web_transport_trait::SendStream + 'static> Drop for SendStream<S> {
 			Some(SendState::Writing { fut, .. }) => {
 				let reset = self.reset.take();
 				let finish = std::mem::take(&mut self.finish);
-				if (reset.is_some() || finish)
-					&& let Ok(handle) = tokio::runtime::Handle::try_current()
-				{
-					handle.spawn(async move {
+				if reset.is_some() || finish {
+					linger(async move {
 						let (mut stream, _) = fut.await;
 						match reset {
 							Some(code) => stream.reset(code),
@@ -539,10 +572,8 @@ impl<S: web_transport_trait::SendStream + 'static> Drop for SendStream<S> {
 			Some(SendState::Closing(fut)) => {
 				let reset = self.reset.take();
 				let finish = std::mem::take(&mut self.finish);
-				if (reset.is_some() || finish)
-					&& let Ok(handle) = tokio::runtime::Handle::try_current()
-				{
-					handle.spawn(async move {
+				if reset.is_some() || finish {
+					linger(async move {
 						let (mut stream, _) = fut.await;
 						match reset {
 							Some(code) => stream.reset(code),
@@ -647,7 +678,7 @@ impl<S: web_transport_trait::RecvStream + 'static> RecvStream<S> {
 						};
 						(stream, res)
 					}
-					.boxed();
+					.op();
 					*self.state.get_mut().unwrap() = Some(RecvState::Reading(fut));
 				}
 				RecvState::Reading(mut fut) => match fut.as_mut().poll(cx) {
@@ -781,10 +812,8 @@ impl<S: web_transport_trait::RecvStream + 'static> Drop for RecvStream<S> {
 			// stop fired the interrupt when it was recorded, so the task never
 			// waits on blocked I/O. Without a runtime the default drop stands.
 			Some(RecvState::Reading(fut)) => {
-				if let Some(code) = self.stop.take()
-					&& let Ok(handle) = tokio::runtime::Handle::try_current()
-				{
-					handle.spawn(async move {
+				if let Some(code) = self.stop.take() {
+					linger(async move {
 						let (mut stream, _) = fut.await;
 						stream.stop(code);
 					});
