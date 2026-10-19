@@ -25,81 +25,90 @@
 #[cfg(all(feature = "noq", not(any(feature = "aws-lc-rs", feature = "ring"))))]
 compile_error!("a rustls QUIC backend requires a crypto provider: enable either the `aws-lc-rs` or `ring` feature");
 
-mod abort;
-pub mod accept;
-pub use moq_sock::bind;
-pub mod cli;
-pub mod client;
-pub mod connect;
-pub mod connection;
-pub mod crypto;
-mod error;
-#[cfg(any(feature = "noq", feature = "tcp", feature = "websocket"))]
-pub mod failover;
-#[cfg(feature = "jemalloc")]
-pub mod jemalloc;
-pub mod listen;
-mod log;
-#[cfg(feature = "noq")]
-pub mod noq;
-pub mod origin;
-pub mod quic;
-#[cfg(any(feature = "noq", feature = "tcp", feature = "websocket"))]
-mod resolve;
-#[cfg(feature = "_transport")]
-pub mod server;
-#[doc(hidden)]
-pub mod settings;
-#[cfg(feature = "tcp")]
-pub mod tcp;
-pub mod tls;
+// The poll adapter is the one module the browser build (wasm) has: every other module
+// needs sockets, files, or tokio's `full`.
 pub mod transport;
-#[cfg(all(feature = "uds", unix))]
-pub mod unix;
-pub mod worker;
-// Resolving a `host:port` bind string is a QUIC-listener concern; the stream
-// listeners take a `SocketAddr`/path straight from their config.
-#[cfg(feature = "noq")]
-mod util;
-#[cfg(feature = "watch")]
-pub mod watch;
-#[cfg(feature = "websocket")]
-pub mod websocket;
 
-// Enumerated rather than globbed, so the root surface is a deliberate list and a
-// new `pub` item in these modules doesn't silently join it.
-pub use client::Client;
-pub use connect::{Addrs, ConnectError};
-pub use connection::{Backoff, Connection, Redirect, Status};
-pub use error::{Error, Result};
-pub use log::{Log, RedactedUrl};
-#[cfg(feature = "_transport")]
-pub use server::{Listener, Server};
+macro_rules! native {
+	($($item:item)*) => { $( #[cfg(not(target_family = "wasm"))] $item )* };
+}
 
-// Re-export these crates.
-pub use moq_net;
-pub use rustls;
+native! {
+	mod abort;
+	pub mod accept;
+	pub use moq_sock::bind;
+	pub mod cli;
+	pub mod client;
+	pub mod connect;
+	pub mod connection;
+	pub mod crypto;
+	mod error;
+	#[cfg(any(feature = "noq", feature = "tcp", feature = "websocket"))]
+	pub mod failover;
+	#[cfg(feature = "jemalloc")]
+	pub mod jemalloc;
+	pub mod listen;
+	mod log;
+	#[cfg(feature = "noq")]
+	pub mod noq;
+	pub mod origin;
+	pub mod quic;
+	#[cfg(any(feature = "noq", feature = "tcp", feature = "websocket"))]
+	mod resolve;
+	#[cfg(feature = "_transport")]
+	pub mod server;
+	#[doc(hidden)]
+	pub mod settings;
+	#[cfg(feature = "tcp")]
+	pub mod tcp;
+	pub mod tls;
+	#[cfg(all(feature = "uds", unix))]
+	pub mod unix;
+	pub mod worker;
+	// Resolving a `host:port` bind string is a QUIC-listener concern; the stream
+	// listeners take a `SocketAddr`/path straight from their config.
+	#[cfg(feature = "noq")]
+	mod util;
+	#[cfg(feature = "watch")]
+	pub mod watch;
+	#[cfg(feature = "websocket")]
+	pub mod websocket;
 
-/// Re-exported because [`watch::Files`] surfaces `notify::Result`/`notify::Error`
-/// in its API; a major `notify` bump is therefore a breaking change for this crate.
-#[cfg(feature = "watch")]
-pub use notify;
+	// Enumerated rather than globbed, so the root surface is a deliberate list and a
+	// new `pub` item in these modules doesn't silently join it.
+	pub use client::Client;
+	pub use connect::{Addrs, ConnectError};
+	pub use connection::{Backoff, Connection, Redirect, Status};
+	pub use error::{Error, Result};
+	pub use log::{Log, RedactedUrl};
+	#[cfg(feature = "_transport")]
+	pub use server::{Listener, Server};
 
-/// Re-exported because [`tls::init_android`] takes a `jni::Env` handle; a major
-/// `jni` bump is therefore a breaking change for this crate.
-#[cfg(target_os = "android")]
-pub use jni;
+	// Re-export these crates.
+	pub use moq_net;
+	pub use rustls;
 
-#[cfg(feature = "iroh")]
-pub mod iroh;
+	/// Re-exported because [`watch::Files`] surfaces `notify::Result`/`notify::Error`
+	/// in its API; a major `notify` bump is therefore a breaking change for this crate.
+	#[cfg(feature = "watch")]
+	pub use notify;
 
-#[cfg(feature = "mdns")]
-pub mod mdns;
+	/// Re-exported because [`tls::init_android`] takes a `jni::Env` handle; a major
+	/// `jni` bump is therefore a breaking change for this crate.
+	#[cfg(target_os = "android")]
+	pub use jni;
 
-/// Whether this build can capture qlog traces, which the `qlog` feature gates.
-///
-/// Setting a qlog directory without it is an error at dial time, so a caller offering
-/// the knob should check here rather than surfacing an option that cannot work.
-pub fn qlog_supported() -> bool {
-	cfg!(feature = "qlog")
+	#[cfg(feature = "iroh")]
+	pub mod iroh;
+
+	#[cfg(feature = "mdns")]
+	pub mod mdns;
+
+	/// Whether this build can capture qlog traces, which the `qlog` feature gates.
+	///
+	/// Setting a qlog directory without it is an error at dial time, so a caller offering
+	/// the knob should check here rather than surfacing an option that cannot work.
+	pub fn qlog_supported() -> bool {
+		cfg!(feature = "qlog")
+	}
 }
