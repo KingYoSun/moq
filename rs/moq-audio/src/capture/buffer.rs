@@ -365,7 +365,7 @@ mod tests {
 					for frame in 0..500 {
 						let time = at + Duration::from_millis(frame * 10);
 						producer.push_interleaved(&input, time);
-						consumer.fill(time, &mut output);
+						consumer.fill(time, std::time::Duration::ZERO, &mut output);
 					}
 				}),
 				0,

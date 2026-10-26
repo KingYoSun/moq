@@ -167,7 +167,7 @@ impl Consumer {
 		}
 	}
 
-	pub(crate) fn fill(&mut self, at: Instant, output: &mut [f32]) {
+	pub(crate) fn fill(&mut self, at: Instant, headroom: Duration, output: &mut [f32]) {
 		self.drain();
 		while self
 			.history
@@ -180,14 +180,17 @@ impl Consumer {
 		// Seek once, and again on a buffer step of half a processing frame.
 		// Between those points preserve the exact played sample sequence: slicing
 		// or interpolating it on each timestamp observation creates a moving echo.
+		// Render headroom only selects the starting position; changing render
+		// availability is not a discontinuity in the microphone's sample clock.
 		let continued = self
 			.next
 			.filter(|(_, expected)| at.max(*expected) - at.min(*expected) < duration(REFERENCE_FRAME) / 2);
+		let target = at + headroom;
 		let cursor = continued.map(|(index, _)| index).or_else(|| {
 			self.history
 				.iter()
-				.min_by_key(|frame| frame.at.max(at) - frame.at.min(at))
-				.filter(|frame| frame.at.max(at) - frame.at.min(at) < duration(REFERENCE_FRAME) / 2)
+				.min_by_key(|frame| frame.at.max(target) - frame.at.min(target))
+				.filter(|frame| frame.at.max(target) - frame.at.min(target) < duration(REFERENCE_FRAME) / 2)
 				.map(|frame| frame.index)
 		});
 		let Some(mut index) = cursor else {
@@ -251,17 +254,54 @@ mod tests {
 	}
 
 	#[test]
+	fn changing_render_headroom_does_not_rewind_the_played_samples() {
+		let (mut producer, mut consumer) = channel(48_000);
+		let at = Instant::now();
+		for value in 0..2 {
+			producer.push_interleaved(&[value as f32; 960], at + Duration::from_millis(value * 10));
+		}
+		let mut heard = [0.0; 960];
+		// First capture uses 10 ms of already available render headroom.
+		consumer.fill(at, Duration::from_millis(10), &mut heard);
+		assert!(heard.iter().all(|v| *v == 1.0));
+		// Capture advances 10 ms, but this callback has no render headroom.
+		consumer.fill(at + Duration::from_millis(10), Duration::ZERO, &mut heard);
+		assert!(
+			heard.iter().all(|v| *v == 0.0),
+			"render availability replayed already consumed samples"
+		);
+		producer.push_interleaved(&[2.0; 960], at + Duration::from_millis(20));
+		consumer.fill(at + Duration::from_millis(20), Duration::ZERO, &mut heard);
+		assert!(heard.iter().all(|v| *v == 2.0));
+		producer.push_interleaved(&[3.0; 960], at + Duration::from_millis(30));
+		producer.push_interleaved(&[4.0; 960], at + Duration::from_millis(40));
+		consumer.fill(at + Duration::from_millis(30), Duration::from_millis(10), &mut heard);
+		assert!(
+			heard.iter().all(|v| *v == 3.0),
+			"restored headroom skipped played samples"
+		);
+	}
+
+	#[test]
 	fn device_time_selects_the_start_then_timestamp_noise_preserves_the_pcm() {
 		let (mut producer, mut consumer) = channel(48_000);
 		let at = Instant::now();
 		let samples: Vec<f32> = (0..1_920).flat_map(|i| [i as f32 / 480.0; 2]).collect();
 		producer.push_interleaved(&samples, at);
 		let mut heard = [0.0; 960];
-		consumer.fill(at + duration(480) + Duration::from_secs_f64(0.5 / 48_000.0), &mut heard);
+		consumer.fill(
+			at + duration(480) + Duration::from_secs_f64(0.5 / 48_000.0),
+			Duration::ZERO,
+			&mut heard,
+		);
 		assert_eq!(&heard, &samples[960..1_920]);
-		consumer.fill(at + duration(960) + Duration::from_micros(500), &mut heard);
+		consumer.fill(
+			at + duration(960) + Duration::from_micros(500),
+			Duration::ZERO,
+			&mut heard,
+		);
 		assert_eq!(&heard, &samples[1_920..2_880]);
-		consumer.fill(at, &mut heard);
+		consumer.fill(at, Duration::ZERO, &mut heard);
 		assert_eq!(
 			&heard,
 			&samples[..960],
@@ -277,19 +317,19 @@ mod tests {
 		producer.push_interleaved(&[2.0; 960], at + Duration::from_millis(5));
 		producer.push_interleaved(&[3.0; 960], at + Duration::from_millis(30));
 		let mut heard = [0.0; 960];
-		consumer.fill(at, &mut heard);
+		consumer.fill(at, Duration::ZERO, &mut heard);
 		assert!(heard.iter().all(|v| *v == 1.0));
-		consumer.fill(at + Duration::from_millis(10), &mut heard);
+		consumer.fill(at + Duration::from_millis(10), Duration::ZERO, &mut heard);
 		assert!(
 			heard.iter().all(|v| *v == 2.0),
 			"timing estimates must not delete played samples"
 		);
-		consumer.fill(at + Duration::from_millis(20), &mut heard);
+		consumer.fill(at + Duration::from_millis(20), Duration::ZERO, &mut heard);
 		assert!(heard.iter().all(|v| *v == 3.0));
-		consumer.fill(at + Duration::from_millis(30), &mut heard);
+		consumer.fill(at + Duration::from_millis(30), Duration::ZERO, &mut heard);
 		assert!(heard.iter().all(|v| *v == 0.0));
 		producer.push_interleaved(&[4.0; 960], at + Duration::from_millis(40));
-		consumer.fill(at + Duration::from_millis(40), &mut heard);
+		consumer.fill(at + Duration::from_millis(40), Duration::ZERO, &mut heard);
 		assert!(heard.iter().all(|v| *v == 4.0));
 	}
 
@@ -302,14 +342,14 @@ mod tests {
 		}
 		assert_eq!(consumer.queued(), CAPACITY);
 		let mut heard = [0.0; 960];
-		consumer.fill(at, &mut heard);
+		consumer.fill(at, Duration::ZERO, &mut heard);
 		assert_eq!(consumer.queued(), 0);
 		assert_eq!(consumer.history.len(), CAPACITY);
-		consumer.fill(at + Duration::from_secs(4), &mut heard);
+		consumer.fill(at + Duration::from_secs(4), Duration::ZERO, &mut heard);
 		assert!(consumer.history.is_empty());
 		for i in 400..1_400 {
 			producer.push_interleaved(&[1.0; 960], at + duration(i * 480));
-			consumer.fill(at + duration(i * 480), &mut heard);
+			consumer.fill(at + duration(i * 480), Duration::ZERO, &mut heard);
 			assert!(consumer.history.len() <= 52);
 			assert_eq!(consumer.history.capacity(), CAPACITY);
 		}
@@ -348,6 +388,7 @@ mod tests {
 		for block in 0..10 {
 			consumer.fill(
 				start + duration(block * 480) + Duration::from_micros(if block % 2 == 0 { 0 } else { 500 }),
+				Duration::ZERO,
 				&mut heard,
 			);
 			for (actual, expected) in heard.iter().zip(&expected[block * 960..(block + 1) * 960]) {

@@ -130,6 +130,7 @@ sound is subtracted, while microphone delivery keeps its existing frame pacing.
 Timestamps select the reference position at the start and on device-buffer steps.
 Between steps the reference keeps the exact played sample sequence, so small
 timestamp measurement noise does not distort the waveform used by the canceller.
+Render headroom can change without repositioning continuous microphone capture.
 
 ```bash
 cargo add moq-audio --features playback                # decode and play the example above

@@ -443,8 +443,7 @@ impl State {
 				let available = reference
 					.available_until()
 					.map_or(Duration::ZERO, |end| end.saturating_duration_since(at + lead));
-				let reference_at = at + available.min(lead);
-				reference.fill(reference_at, reference_frame);
+				reference.fill(at, available.min(lead), reference_frame);
 			} else {
 				reference_frame.fill(0.0);
 			}
@@ -1222,7 +1221,7 @@ mod tests {
 			// what the speaker was given.
 			let mut state = canceller.inner.state.lock().unwrap();
 			if let Some(reference) = state.reference.as_mut() {
-				reference.fill(Instant::now() - Duration::from_millis(20), &mut buf);
+				reference.fill(Instant::now() - Duration::from_millis(20), Duration::ZERO, &mut buf);
 				energy += buf.iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
 			}
 		}
