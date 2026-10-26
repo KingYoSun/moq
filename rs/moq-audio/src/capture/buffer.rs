@@ -25,6 +25,7 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Create a pool and its bounded filled-buffer queue.
 pub(super) fn channel(
+	sample_rate: u32,
 	channels: usize,
 	#[cfg(feature = "aec")] aec: Option<crate::aec::Attachment>,
 ) -> (Writer, Reader) {
@@ -59,8 +60,11 @@ pub(super) fn channel(
 		pending_gap: false,
 		dropped: dropped.clone(),
 		channels,
+		sample_rate,
 		#[cfg(feature = "aec")]
 		aec,
+		#[cfg(feature = "aec")]
+		clock: crate::aec::reference::Clock::default(),
 	};
 	let reader = Reader {
 		rx,
@@ -117,32 +121,50 @@ pub(super) struct Writer {
 	pending_gap: bool,
 	dropped: Arc<AtomicU64>,
 	channels: usize,
+	sample_rate: u32,
 	#[cfg(feature = "aec")]
 	aec: Option<crate::aec::Attachment>,
+	#[cfg(feature = "aec")]
+	clock: crate::aec::reference::Clock,
 }
 
 impl Writer {
+	pub(super) fn captured_at(&mut self, info: &cpal::InputCallbackInfo) -> Instant {
+		#[cfg(feature = "aec")]
+		{
+			let timestamp = info.timestamp();
+			self.clock.at(timestamp.callback, timestamp.capture)
+		}
+		#[cfg(not(feature = "aec"))]
+		{
+			let _ = info;
+			Instant::now()
+		}
+	}
 	/// Copy native `f32` samples into preallocated buffers.
-	pub(super) fn write_f32(&mut self, input: &[f32]) {
-		self.write(input, |sample| sample);
+	pub(super) fn write_f32(&mut self, input: &[f32], captured_at: Instant) {
+		self.write(input, |sample| sample, captured_at);
 	}
 
 	/// Convert native signed samples into preallocated buffers.
-	pub(super) fn write_i16(&mut self, input: &[i16]) {
-		self.write(input, |sample| sample as f32 / 32768.0);
+	pub(super) fn write_i16(&mut self, input: &[i16], captured_at: Instant) {
+		self.write(input, |sample| sample as f32 / 32768.0, captured_at);
 	}
 
 	/// Convert native unsigned samples into preallocated buffers.
-	pub(super) fn write_u16(&mut self, input: &[u16]) {
-		self.write(input, |sample| (sample as f32 - 32768.0) / 32768.0);
+	pub(super) fn write_u16(&mut self, input: &[u16], captured_at: Instant) {
+		self.write(input, |sample| (sample as f32 - 32768.0) / 32768.0, captured_at);
 	}
 
 	/// Convert and submit one host callback without touching the allocator.
-	fn write<T: Copy>(&mut self, input: &[T], convert: impl Fn(T) -> f32) {
+	fn write<T: Copy>(&mut self, input: &[T], convert: impl Fn(T) -> f32, captured_at: Instant) {
 		let chunk_samples = CHUNK_FRAMES * self.channels;
 		let complete = input.len() - input.len() % self.channels;
 
-		for input in input[..complete].chunks(chunk_samples) {
+		for (index, input) in input[..complete].chunks(chunk_samples).enumerate() {
+			let at = captured_at + Duration::from_secs_f64((index * CHUNK_FRAMES) as f64 / f64::from(self.sample_rate));
+			#[cfg(not(feature = "aec"))]
+			let _ = at;
 			let Some(mut output) = self.take() else {
 				self.drop_one();
 				continue;
@@ -153,7 +175,7 @@ impl Writer {
 
 			#[cfg(feature = "aec")]
 			if let Some(aec) = &self.aec {
-				aec.process(&mut output.data);
+				aec.process(&mut output.data, at);
 			}
 
 			let recycle = CachingProd::new(self.recycle[output.slot].ring.clone());
@@ -311,6 +333,7 @@ mod tests {
 
 	fn create(channels: usize) -> (Writer, Reader) {
 		channel(
+			48_000,
 			channels,
 			#[cfg(feature = "aec")]
 			None,
@@ -325,8 +348,30 @@ mod tests {
 		)
 		.unwrap();
 		let attachment = aec.attach(48_000, channels as u32).unwrap();
-		let (writer, reader) = channel(channels, Some(attachment));
+		let (writer, reader) = channel(48_000, channels, Some(attachment));
 		(writer, reader, aec)
+	}
+
+	#[cfg(feature = "aec")]
+	#[test]
+	fn timed_reference_callbacks_do_not_allocate() {
+		for rate in [48_000, 44_100] {
+			let (mut producer, mut consumer) = crate::aec::reference::channel(rate);
+			let at = Instant::now();
+			let input = vec![0.25; rate as usize / 100 * 2];
+			let mut output = [0.0; 960];
+			assert_eq!(
+				activity(|| {
+					for frame in 0..500 {
+						let time = at + Duration::from_millis(frame * 10);
+						producer.push_interleaved(&input, time);
+						consumer.fill(time, &mut output);
+					}
+				}),
+				0,
+				"{rate} Hz reference callback allocated"
+			);
+		}
 	}
 
 	#[test]
@@ -336,9 +381,9 @@ mod tests {
 		let i16s = vec![8192i16; 960 * 2];
 		let u16s = vec![40960u16; 960 * 2];
 
-		assert_eq!(activity(|| writer.write_f32(&f32s)), 0);
-		assert_eq!(activity(|| writer.write_i16(&i16s)), 0);
-		assert_eq!(activity(|| writer.write_u16(&u16s)), 0);
+		assert_eq!(activity(|| writer.write_f32(&f32s, std::time::Instant::now())), 0);
+		assert_eq!(activity(|| writer.write_i16(&i16s, std::time::Instant::now())), 0);
+		assert_eq!(activity(|| writer.write_u16(&u16s, std::time::Instant::now())), 0);
 	}
 
 	#[tokio::test]
@@ -347,7 +392,7 @@ mod tests {
 		let input = vec![0.25f32; 480];
 
 		for _ in 0..128 {
-			assert_eq!(activity(|| writer.write_f32(&input)), 0);
+			assert_eq!(activity(|| writer.write_f32(&input, std::time::Instant::now())), 0);
 			drop(reader.recv().await.unwrap());
 		}
 	}
@@ -360,7 +405,7 @@ mod tests {
 		let thread = std::thread::spawn(move || {
 			let activity = activity(|| {
 				for _ in 0..DEPTH * 4 {
-					writer.write_f32(&input);
+					writer.write_f32(&input, std::time::Instant::now());
 				}
 			});
 			done.send(activity).unwrap();
@@ -375,12 +420,12 @@ mod tests {
 		let (mut writer, mut reader) = create(1);
 		let input = vec![0.5; 480];
 
-		writer.write_f32(&input);
+		writer.write_f32(&input, std::time::Instant::now());
 		let released = reader.recv().await.unwrap();
 		let address = released.data.as_ptr();
 		drop(released);
 
-		writer.write_f32(&input);
+		writer.write_f32(&input, std::time::Instant::now());
 		let reused = reader.recv().await.unwrap();
 		assert_eq!(reused.data.as_ptr(), address);
 	}
@@ -391,15 +436,15 @@ mod tests {
 		let backlog = vec![0.5; 480];
 
 		for _ in 0..DEPTH {
-			writer.write_f32(&backlog);
+			writer.write_f32(&backlog, std::time::Instant::now());
 		}
-		writer.write_f32(&[0.75; 480]);
+		writer.write_f32(&[0.75; 480], std::time::Instant::now());
 
 		let first = reader.recv().await.unwrap();
 		assert!(!first.gap);
 		assert_eq!(first.data[0], 0.5);
 		drop(first);
-		writer.write_f32(&[1.0; 480]);
+		writer.write_f32(&[1.0; 480], std::time::Instant::now());
 
 		for _ in 1..DEPTH {
 			let backlog = reader.recv().await.unwrap();
@@ -416,15 +461,15 @@ mod tests {
 	async fn overflow_discards_partial_aec_frames() {
 		let (mut writer, mut reader, aec) = create_with_aec(1);
 
-		writer.write_f32(&[0.5; 512]);
+		writer.write_f32(&[0.5; 512], std::time::Instant::now());
 		for _ in 1..DEPTH {
-			writer.write_f32(&[0.5; 480]);
+			writer.write_f32(&[0.5; 480], std::time::Instant::now());
 		}
 		assert_eq!(aec.pending_samples(), 32);
 
-		writer.write_f32(&[0.75; 512]);
+		writer.write_f32(&[0.75; 512], std::time::Instant::now());
 		drop(reader.recv().await.unwrap());
-		writer.write_f32(&[1.0; 448]);
+		writer.write_f32(&[1.0; 448], std::time::Instant::now());
 
 		assert_eq!(
 			aec.pending_samples(),
@@ -438,6 +483,6 @@ mod tests {
 		let (mut writer, _reader) = create(2);
 		let input = vec![0.25f32; (CHUNK_FRAMES * 2) + 960];
 
-		assert_eq!(activity(|| writer.write_f32(&input)), 0);
+		assert_eq!(activity(|| writer.write_f32(&input, std::time::Instant::now())), 0);
 	}
 }
