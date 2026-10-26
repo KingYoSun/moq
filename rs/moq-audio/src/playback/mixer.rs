@@ -620,6 +620,7 @@ mod tests {
 		let mut heard = vec![0.0f32; 2048 * REFERENCE_CHANNELS];
 		tap.fill(
 			harness.at - Duration::from_secs_f64((heard.len() / REFERENCE_CHANNELS) as f64 / f64::from(RATE)),
+			Duration::ZERO,
 			&mut heard,
 		);
 
@@ -630,6 +631,7 @@ mod tests {
 		harness.settle(&mut out);
 		tap.fill(
 			harness.at - Duration::from_secs_f64((heard.len() / REFERENCE_CHANNELS) as f64 / f64::from(RATE)),
+			Duration::ZERO,
 			&mut heard,
 		);
 		let tail = &heard[heard.len() - 64..];
@@ -741,6 +743,7 @@ mod tests {
 		let mut heard = vec![0.0f32; 2048 * REFERENCE_CHANNELS];
 		tap.fill(
 			harness.at - Duration::from_secs_f64((heard.len() / REFERENCE_CHANNELS) as f64 / f64::from(RATE)),
+			Duration::ZERO,
 			&mut heard,
 		);
 
@@ -749,6 +752,7 @@ mod tests {
 		harness.settle(&mut out);
 		tap.fill(
 			harness.at - Duration::from_secs_f64((heard.len() / REFERENCE_CHANNELS) as f64 / f64::from(RATE)),
+			Duration::ZERO,
 			&mut heard,
 		);
 
