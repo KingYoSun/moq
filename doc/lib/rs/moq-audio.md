@@ -131,6 +131,9 @@ Timestamps select the reference position at the start and on device-buffer steps
 Between steps the reference keeps the exact played sample sequence, so small
 timestamp measurement noise does not distort the waveform used by the canceller.
 Render headroom can change without repositioning continuous microphone capture.
+If a device-clock estimate runs ahead of available render data, the latest
+complete buffered frame remains usable. Waiting for more data never replays a
+consumed frame.
 
 ```bash
 cargo add moq-audio --features playback                # decode and play the example above
