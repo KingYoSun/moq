@@ -14,10 +14,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
-
-use fixed_resample::ResamplingCons;
 #[cfg(feature = "aec")]
-use fixed_resample::ResamplingProd;
+use std::time::Duration;
+use std::time::Instant;
+
+#[cfg(feature = "aec")]
+use crate::aec::ReferenceProducer;
+use fixed_resample::ResamplingCons;
 
 #[cfg(feature = "aec")]
 use crate::resample::Remix;
@@ -111,7 +114,7 @@ pub(super) enum Command {
 	Remove { id: u64 },
 	/// Copy the mix into an echo-cancellation reference, or stop with `None`.
 	#[cfg(feature = "aec")]
-	Reference(Option<ResamplingProd<f32>>),
+	Reference(Option<ReferenceProducer>),
 }
 
 /// One sink being mixed, owned by the audio thread until it is retired.
@@ -133,7 +136,7 @@ pub(super) enum Retired {
 	Sink(Entry),
 	/// The echo reference a canceller replaced or gave up.
 	#[cfg(feature = "aec")]
-	Reference(ResamplingProd<f32>),
+	Reference(ReferenceProducer),
 }
 
 /// The state behind the output callback.
@@ -146,6 +149,8 @@ pub(super) struct Mixer {
 	/// Channels the device takes, which is also the bus layout's: every sink
 	/// remixes into it on its way here.
 	channels: usize,
+	#[cfg(feature = "aec")]
+	rate: u32,
 	/// Per-frame gain step, so any change spans [`RAMP`] regardless of rate.
 	step: f32,
 	/// Accumulator for one chunk, in the device's layout.
@@ -156,7 +161,7 @@ pub(super) struct Mixer {
 	/// that is the signal the speaker gets and therefore the one the microphone
 	/// hears back.
 	#[cfg(feature = "aec")]
-	reference: Option<ResamplingProd<f32>>,
+	reference: Option<ReferenceProducer>,
 	/// Downmixes the bus to the reference's stereo.
 	#[cfg(feature = "aec")]
 	downmix: Remix,
@@ -188,6 +193,8 @@ impl Mixer {
 			commands,
 			retired,
 			channels,
+			#[cfg(feature = "aec")]
+			rate,
 			step: 1.0 / (rate as f32 * RAMP),
 			bus: vec![0.0; CHUNK * channels],
 			scratch: vec![0.0; CHUNK * channels],
@@ -214,7 +221,9 @@ impl Mixer {
 	}
 
 	/// Fill one device buffer, interleaved at the device's channel count.
-	pub(super) fn fill(&mut self, out: &mut [f32]) {
+	pub(super) fn fill(&mut self, out: &mut [f32], at: Instant) {
+		#[cfg(not(feature = "aec"))]
+		let _ = at;
 		loop {
 			match self.commands.try_recv() {
 				Ok(Command::Add { id, cons, gain }) => {
@@ -259,6 +268,8 @@ impl Mixer {
 		let Self {
 			entries,
 			channels,
+			#[cfg(feature = "aec")]
+			rate,
 			step,
 			bus,
 			scratch,
@@ -319,7 +330,7 @@ impl Mixer {
 			if let Some(reference) = reference.as_mut() {
 				let stereo = &mut stereo[..frames * REFERENCE_CHANNELS];
 				downmix.apply(&bus[..samples], stereo);
-				reference.push_interleaved(stereo);
+				reference.push_interleaved(stereo, at + Duration::from_secs_f64(done as f64 / f64::from(*rate)));
 			}
 
 			out[done * channels..(done + frames) * channels].copy_from_slice(&bus[..samples]);
@@ -332,6 +343,7 @@ impl Mixer {
 #[cfg(test)]
 mod tests {
 	use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+	use std::time::Duration;
 
 	use fixed_resample::{PushStatus, ResamplingChannelConfig, ResamplingProd, resampling_channel};
 
@@ -354,6 +366,7 @@ mod tests {
 		/// audio thread never drops one.
 		retired: Receiver<Retired>,
 		next: u64,
+		at: Instant,
 		channels: usize,
 	}
 
@@ -370,6 +383,7 @@ mod tests {
 				commands,
 				retired,
 				next: 0,
+				at: Instant::now(),
 				channels: layout.channels() as usize,
 			}
 		}
@@ -404,7 +418,8 @@ mod tests {
 		/// consumer has read once, exactly as it does for the real device before
 		/// its first callback.
 		fn fill(&mut self, out: &mut [f32]) {
-			self.mixer.fill(out);
+			self.mixer.fill(out, self.at);
+			self.at += Duration::from_secs_f64((out.len() / self.channels) as f64 / f64::from(RATE));
 		}
 
 		/// Fill twice and hand back the buffer, so assertions look at gain that has
@@ -603,14 +618,20 @@ mod tests {
 		// read also primes the channel with its configured latency in silence,
 		// which is why the buffer below is read past it rather than at it.
 		let mut heard = vec![0.0f32; 2048 * REFERENCE_CHANNELS];
-		tap.read_interleaved(&mut heard, false);
+		tap.fill(
+			harness.at - Duration::from_secs_f64((heard.len() / REFERENCE_CHANNELS) as f64 / f64::from(RATE)),
+			&mut heard,
+		);
 
 		for prod in &mut prods {
 			push(prod, 0.5, FRAMES);
 		}
 
 		harness.settle(&mut out);
-		tap.read_interleaved(&mut heard, false);
+		tap.fill(
+			harness.at - Duration::from_secs_f64((heard.len() / REFERENCE_CHANNELS) as f64 / f64::from(RATE)),
+			&mut heard,
+		);
 		let tail = &heard[heard.len() - 64..];
 		assert!(
 			tail.iter().all(|s| (*s - 1.0).abs() < 1e-5),
@@ -655,18 +676,8 @@ mod tests {
 	/// A tap running at the device rate, so the assertions see the mix untouched
 	/// by resampling.
 	#[cfg(feature = "aec")]
-	fn reference_channel() -> (ResamplingProd<f32>, ResamplingCons<f32>) {
-		resampling_channel::<f32>(
-			REFERENCE_CHANNELS,
-			RATE,
-			RATE,
-			true,
-			ResamplingChannelConfig {
-				latency_seconds: 0.02,
-				capacity_seconds: 0.2,
-				..Default::default()
-			},
-		)
+	fn reference_channel() -> (ReferenceProducer, crate::aec::reference::Consumer) {
+		crate::aec::reference::channel(RATE)
 	}
 
 	/// The entry list is allocated once. Growing it would allocate on the audio
@@ -728,12 +739,18 @@ mod tests {
 		harness.fill(&mut out);
 
 		let mut heard = vec![0.0f32; 2048 * REFERENCE_CHANNELS];
-		tap.read_interleaved(&mut heard, false);
+		tap.fill(
+			harness.at - Duration::from_secs_f64((heard.len() / REFERENCE_CHANNELS) as f64 / f64::from(RATE)),
+			&mut heard,
+		);
 
 		// Center only, which a stereo downmix splits evenly at -3 dB.
 		prod.push_interleaved(&[0.0, 0.0, 0.5, 0.0, 0.0, 0.0].repeat(FRAMES));
 		harness.settle(&mut out);
-		tap.read_interleaved(&mut heard, false);
+		tap.fill(
+			harness.at - Duration::from_secs_f64((heard.len() / REFERENCE_CHANNELS) as f64 / f64::from(RATE)),
+			&mut heard,
+		);
 
 		let want = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
 		let tail = &heard[heard.len() - 64..];

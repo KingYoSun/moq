@@ -394,6 +394,7 @@ impl Microphone {
 			.map_err(Failure::fatal)?;
 
 		let (mut writer, rx) = buffer::channel(
+			sample_rate,
 			channels as usize,
 			#[cfg(feature = "aec")]
 			aec,
@@ -409,7 +410,10 @@ impl Microphone {
 				let errors = error_tx.clone();
 				device.build_input_stream(
 					stream_config,
-					move |data: &[f32], _: &_| writer.write_f32(data),
+					move |data: &[f32], info: &_| {
+						let at = writer.captured_at(info);
+						writer.write_f32(data, at);
+					},
 					move |err| stream_err(&errors, err),
 					None,
 				)
@@ -418,7 +422,10 @@ impl Microphone {
 				let errors = error_tx.clone();
 				device.build_input_stream(
 					stream_config,
-					move |data: &[i16], _: &_| writer.write_i16(data),
+					move |data: &[i16], info: &_| {
+						let at = writer.captured_at(info);
+						writer.write_i16(data, at);
+					},
 					move |err| stream_err(&errors, err),
 					None,
 				)
@@ -427,7 +434,10 @@ impl Microphone {
 				let errors = error_tx.clone();
 				device.build_input_stream(
 					stream_config,
-					move |data: &[u16], _: &_| writer.write_u16(data),
+					move |data: &[u16], info: &_| {
+						let at = writer.captured_at(info);
+						writer.write_u16(data, at);
+					},
 					move |err| stream_err(&errors, err),
 					None,
 				)
@@ -754,6 +764,7 @@ mod tests {
 
 	fn reader() -> (buffer::Writer, kio::Producer<Option<cpal::Error>>, MicrophoneReader) {
 		let (tx, rx) = buffer::channel(
+			48_000,
 			1,
 			#[cfg(feature = "aec")]
 			None,
@@ -789,7 +800,7 @@ mod tests {
 		drop(old_reader);
 
 		fail(&old_errors, "stale");
-		new_samples.write_f32(&[1.0]);
+		new_samples.write_f32(&[1.0], std::time::Instant::now());
 		let samples = new_reader.read().await.unwrap().unwrap();
 		assert_eq!(samples.data, vec![1.0]);
 	}

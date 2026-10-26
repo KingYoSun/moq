@@ -124,6 +124,10 @@ capture frees the microphone slot. The engine slot frees only once every
 `Control` clone and the live capture have dropped, since a capture holds the
 controls alive.
 
+Echo cancellation matches the playback reference to each microphone frame using
+device timestamps. A bounded history keeps delayed callbacks from changing which
+sound is subtracted, while microphone delivery keeps its existing frame pacing.
+
 ```bash
 cargo add moq-audio --features playback                # decode and play the example above
 cargo add moq-audio --features capture,playback,aec    # microphone, speaker, echo cancellation (Linux: cpal links libasound)

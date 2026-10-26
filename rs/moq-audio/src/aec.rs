@@ -34,13 +34,16 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
-use fixed_resample::{ResamplingChannelConfig, ResamplingCons, ResamplingProd, resampling_channel};
 use sonora::config::{EchoCanceller, GainController2, NoiseSuppression, NoiseSuppressionLevel};
 use sonora::{AudioProcessing, StreamConfig};
 
 use crate::Error;
 use crate::playback::{self, REFERENCE_CHANNELS};
+
+pub(crate) mod reference;
+pub(crate) use reference::Producer as ReferenceProducer;
 
 /// Sample rate the echo reference is resampled to on its way out of the mixer.
 ///
@@ -48,21 +51,6 @@ use crate::playback::{self, REFERENCE_CHANNELS};
 /// invalidate an adaptive filter that spent seconds converging. Devices run at
 /// 48 kHz far more often than not, in which case this resamples nothing.
 const REFERENCE_RATE: u32 = 48_000;
-
-/// Slack between the output callback and the microphone callback, for the
-/// jitter between two independently scheduled threads.
-///
-/// Not a target depth. The microphone callback drains this queue every pass, so
-/// what it holds is only what the output callback has produced since, and the
-/// reference keeps the full head start the output hardware's own buffering
-/// gives it. A standing queue here would be subtracted from that head start,
-/// and a device that buffers less than the queue holds would see its echo
-/// arrive before the reference describing it, which is a reference the model
-/// cannot use at all.
-const REFERENCE_LATENCY: f64 = 0.01;
-
-/// Ceiling on that queue, bounding what a closed microphone can pin.
-const REFERENCE_CAPACITY: f64 = 0.2;
 
 /// Samples per channel in one 10 ms reference frame.
 const REFERENCE_FRAME: usize = REFERENCE_RATE as usize / 100;
@@ -224,7 +212,7 @@ impl Control {
 		// whatever was playing back then. Feeding that in as if it were current
 		// would put the echo model seconds out.
 		if let Some(reference) = &mut state.reference {
-			reference.discard_frames(reference.available_frames());
+			reference.clear();
 		}
 
 		drop(state);
@@ -265,7 +253,7 @@ impl Attachment {
 	/// microphone callback thread, so it never waits for the playback driver.
 	/// Contention during a reference switch passes this buffer through; the
 	/// next callback resumes cancellation.
-	pub(crate) fn process(&self, buf: &mut [f32]) {
+	pub(crate) fn process(&self, buf: &mut [f32], captured_at: Instant) {
 		let enabled = self.inner.enabled.load(Ordering::Relaxed);
 		let Ok(mut state) = self.inner.state.try_lock() else {
 			self.mark_discontinuous();
@@ -274,7 +262,7 @@ impl Attachment {
 		if self.inner.discontinuous.swap(false, Ordering::Relaxed) {
 			state.reset();
 		}
-		state.process(buf, enabled);
+		state.process(buf, enabled, captured_at);
 	}
 
 	/// Discard partial frames before processing the next capture buffer.
@@ -288,7 +276,7 @@ impl Drop for Attachment {
 		let mut state = self.inner.state.lock().unwrap();
 		state.reset();
 		if let Some(reference) = &mut state.reference {
-			reference.discard_frames(reference.available_frames());
+			reference.clear();
 		}
 		drop(state);
 		self.inner.attached.store(false, Ordering::Release);
@@ -331,7 +319,7 @@ struct State {
 	capture: StreamConfig,
 	/// Reference from the output mixer, replaced whenever the output stream is
 	/// rebuilt and `None` while none is running.
-	reference: Option<ResamplingCons<f32>>,
+	reference: Option<reference::Consumer>,
 
 	/// Whether the last callback cancelled, so a toggle can drop the buffers
 	/// that no longer line up.
@@ -397,7 +385,7 @@ impl State {
 		self.running = false;
 	}
 
-	fn process(&mut self, buf: &mut [f32], enabled: bool) {
+	fn process(&mut self, buf: &mut [f32], enabled: bool, captured_at: Instant) {
 		let Self {
 			processor,
 			capture,
@@ -434,33 +422,34 @@ impl State {
 			// what is playing then rather than on what filled the queue while
 			// nobody was reading it.
 			if let Some(reference) = reference {
-				reference.discard_frames(reference.available_frames());
+				reference.clear();
 			}
 			return;
 		}
 		*running = true;
 
-		// The reference first: the echo model has to be told what was played
-		// before it is asked to find it in the microphone.
-		//
-		// Everything the mixer has produced goes in, rather than one frame per
-		// microphone frame. Pacing it against capture would leave whatever the
-		// queue starts out holding in it forever, as a fixed delay on top of the
-		// hardware's, and a reference that trails its own echo is one the model
-		// cannot subtract. Draining instead means the reference is never older
-		// than the last output callback, so it leads the echo by however much
-		// the output device buffers, however little that is.
-		if let Some(reference) = reference {
-			while reference.available_frames() >= REFERENCE_FRAME {
-				reference.read_interleaved(reference_frame, false);
-				deinterleave(reference_frame, render_in, REFERENCE_CHANNELS);
-				let _ = process_render(processor, render_in, render_out);
-			}
-		}
+		// Capture may arrive late. Its device timestamp, rather than callback order,
+		// identifies the speaker samples belonging to each microphone frame.
+		let mut at =
+			captured_at - Duration::from_secs_f64((pending.len() / channels) as f64 / capture.sample_rate_hz() as f64);
 
 		pending.extend_from_slice(buf);
 
 		while pending.len() >= stride {
+			if let Some(reference) = reference {
+				// Keep one processing frame of render headroom when the device has
+				// already supplied it. This never holds back microphone samples.
+				let lead = Duration::from_millis(10);
+				let available = reference
+					.available_until()
+					.map_or(Duration::ZERO, |end| end.saturating_duration_since(at + lead));
+				let reference_at = at + available.min(lead);
+				reference.fill(reference_at, reference_frame);
+			} else {
+				reference_frame.fill(0.0);
+			}
+			deinterleave(reference_frame, render_in, REFERENCE_CHANNELS);
+			let _ = process_render(processor, render_in, render_out);
 			deinterleave(&pending[..stride], capture_in, channels);
 			match process_capture(processor, capture, capture_in, capture_out) {
 				Ok(()) => interleave(capture_out, channels, processed),
@@ -471,6 +460,7 @@ impl State {
 			}
 
 			pending.drain(..stride);
+			at += Duration::from_secs_f64((stride / channels) as f64 / capture.sample_rate_hz() as f64);
 		}
 
 		// Hand back exactly what came in. Short only while the first frame is
@@ -556,7 +546,7 @@ pub(crate) struct Reference {
 	state: Arc<Mutex<State>>,
 	/// The producer waiting to be handed to a mixer, refilled by
 	/// [`rebuild`](Self::rebuild).
-	pending: Option<ResamplingProd<f32>>,
+	pending: Option<ReferenceProducer>,
 }
 
 impl Reference {
@@ -572,12 +562,12 @@ impl Reference {
 
 	/// The producer to hand to a running mixer, or `None` if one is already
 	/// there.
-	pub(crate) fn take(&mut self) -> Option<ResamplingProd<f32>> {
+	pub(crate) fn take(&mut self) -> Option<ReferenceProducer> {
 		self.pending.take()
 	}
 
 	/// Put back a producer the mixer refused, so the next attach retries.
-	pub(crate) fn restore(&mut self, prod: ResamplingProd<f32>) {
+	pub(crate) fn restore(&mut self, prod: ReferenceProducer) {
 		self.pending = Some(prod);
 	}
 
@@ -591,36 +581,11 @@ impl Reference {
 			return false;
 		}
 
-		let (prod, mut cons) = channel(rate);
-		// fixed-resample drops every push until the consumer has read once, and the canceller only reads
-		// once frames are available, so prime it with an empty read.
-		cons.read_interleaved(&mut [], false);
+		let (prod, cons) = reference::channel(rate);
 		self.state.lock().unwrap().reference = Some(cons);
 		self.pending = Some(prod);
 		true
 	}
-}
-
-/// The tap itself: the mixer pushes the device's mix in at `rate` and the
-/// canceller reads it back at [`REFERENCE_RATE`].
-fn channel(rate: u32) -> (ResamplingProd<f32>, ResamplingCons<f32>) {
-	resampling_channel::<f32>(
-		REFERENCE_CHANNELS,
-		rate,
-		REFERENCE_RATE,
-		true,
-		ResamplingChannelConfig {
-			latency_seconds: REFERENCE_LATENCY,
-			capacity_seconds: REFERENCE_CAPACITY,
-			// A near-empty queue is the normal state here, not an underflow to
-			// correct: the microphone callback drains it every pass. Left on,
-			// the default would pad it back up to the target depth with silence
-			// the speaker never played, which is both a fabricated reference and
-			// the standing delay this is shaped to avoid.
-			underflow_autocorrect_percent_threshold: None,
-			..Default::default()
-		},
-	)
 }
 
 #[cfg(test)]
@@ -647,15 +612,18 @@ mod tests {
 
 	/// Give `canceller` a tap and hand back the end the mixer would push into,
 	/// built exactly as the driver builds it so the two can't drift.
-	fn tap(canceller: &Attachment) -> ResamplingProd<f32> {
-		let (prod, cons) = channel(REFERENCE_RATE);
+	fn tap(canceller: &Attachment) -> ReferenceProducer {
+		let (prod, cons) = reference::channel(REFERENCE_RATE);
 		canceller.inner.state.lock().unwrap().reference = Some(cons);
 		prod
 	}
 
 	/// Push one 10 ms stereo frame of `value` into the tap.
-	fn play(prod: &mut ResamplingProd<f32>, value: f32) {
-		prod.push_interleaved(&vec![value; REFERENCE_FRAME * REFERENCE_CHANNELS]);
+	fn play(prod: &mut ReferenceProducer, value: f32) {
+		prod.push_interleaved(
+			&vec![value; REFERENCE_FRAME * REFERENCE_CHANNELS],
+			std::time::Instant::now(),
+		);
 	}
 
 	#[test]
@@ -673,7 +641,7 @@ mod tests {
 		let canceller = opened(48_000, 2);
 		for frames in [64, 480, 512, 4096] {
 			let mut buf = vec![0.25f32; frames * 2];
-			canceller.process(&mut buf);
+			canceller.process(&mut buf, std::time::Instant::now());
 			assert_eq!(buf.len(), frames * 2, "{frames} frames");
 		}
 	}
@@ -690,7 +658,7 @@ mod tests {
 		let mut loud = false;
 		for _ in 0..20 {
 			let mut buf = vec![0.5f32; frame];
-			canceller.process(&mut buf);
+			canceller.process(&mut buf, std::time::Instant::now());
 			loud |= buf.iter().any(|s| s.abs() > 0.01);
 		}
 		assert!(loud, "the microphone came back silent");
@@ -704,12 +672,12 @@ mod tests {
 		let frame = frame(48_000);
 
 		let mut first = vec![0.5f32; frame * 3 / 2];
-		canceller.process(&mut first);
+		canceller.process(&mut first, std::time::Instant::now());
 		let silent = first.iter().rev().take_while(|s| **s == 0.0).count();
 		assert_eq!(silent, frame / 2, "expected the leftover half-frame to be held back");
 
 		let mut second = vec![0.5f32; frame * 3 / 2];
-		canceller.process(&mut second);
+		canceller.process(&mut second, std::time::Instant::now());
 		assert_ne!(second.last(), Some(&0.0), "the leftover was never made up");
 	}
 
@@ -723,7 +691,7 @@ mod tests {
 		let mut short = 0;
 		for round in 0..20 {
 			let mut buf = vec![0.5f32; chunk];
-			canceller.process(&mut buf);
+			canceller.process(&mut buf, std::time::Instant::now());
 			// Past the first couple of rounds the pipeline is primed, so every
 			// callback has to come back full.
 			if round > 2 {
@@ -744,7 +712,7 @@ mod tests {
 		assert!(matches!(ui.attach(48_000, 2), Err(Error::Busy(_))));
 
 		let mut buf = vec![0.5f32; 960 * 2];
-		canceller.process(&mut buf);
+		canceller.process(&mut buf, std::time::Instant::now());
 		assert!(buf.iter().all(|s| *s == 0.5), "passthrough altered the samples");
 	}
 
@@ -757,7 +725,7 @@ mod tests {
 
 		let thread = std::thread::spawn(move || {
 			let mut buf = vec![0.5f32; 480];
-			callback.process(&mut buf);
+			callback.process(&mut buf, std::time::Instant::now());
 			done.send(buf).unwrap();
 		});
 
@@ -776,17 +744,17 @@ mod tests {
 		let frame = frame(48_000);
 
 		let mut first = vec![0.5f32; frame + 32];
-		canceller.process(&mut first);
+		canceller.process(&mut first, std::time::Instant::now());
 		assert_eq!(canceller.inner.state.lock().unwrap().pending.len(), 32);
 
 		let locked = canceller.inner.state.lock().unwrap();
 		let mut bypassed = vec![0.25f32; frame + 32];
-		canceller.process(&mut bypassed);
+		canceller.process(&mut bypassed, std::time::Instant::now());
 		drop(locked);
 		assert!(bypassed.iter().all(|sample| *sample == 0.25));
 
 		let mut resumed = vec![0.75f32; frame - 32];
-		canceller.process(&mut resumed);
+		canceller.process(&mut resumed, std::time::Instant::now());
 		assert_eq!(
 			canceller.inner.state.lock().unwrap().pending.len(),
 			frame - 32,
@@ -803,12 +771,12 @@ mod tests {
 		let frame = frame(48_000);
 
 		let mut buf = vec![0.5f32; frame * 3 / 2];
-		canceller.process(&mut buf);
+		canceller.process(&mut buf, std::time::Instant::now());
 		assert!(!canceller.inner.state.lock().unwrap().pending.is_empty());
 
 		control.set_enabled(false);
 		let mut buf = vec![0.5f32; frame / 2];
-		canceller.process(&mut buf);
+		canceller.process(&mut buf, std::time::Instant::now());
 		assert!(buf.iter().all(|s| *s == 0.5), "passthrough altered the samples");
 
 		let state = canceller.inner.state.lock().unwrap();
@@ -870,11 +838,8 @@ mod tests {
 		drop(control.attach(48_000, 1).expect("teardown releases the state"));
 	}
 
-	/// Anything left queued in the tap is delay added on top of the hardware's,
-	/// and once it exceeds what the output device buffers, the echo reaches the
-	/// microphone before the reference describing it and cancellation is no
-	/// longer possible at all. So a pass has to take everything, not one frame
-	/// per microphone frame.
+	/// A long output period is received in one pass, then read by sample time
+	/// rather than made into extra microphone latency.
 	#[test]
 	fn a_pass_drains_the_whole_tap() {
 		let canceller = opened(48_000, 1);
@@ -882,16 +847,16 @@ mod tests {
 		let frame = frame(48_000);
 
 		// The tap discards until the canceller has read once, so prime it.
-		canceller.process(&mut vec![0.0f32; frame]);
+		canceller.process(&mut vec![0.0f32; frame], std::time::Instant::now());
 		play(&mut prod, 0.5);
-		canceller.process(&mut vec![0.0f32; frame]);
+		canceller.process(&mut vec![0.0f32; frame], std::time::Instant::now());
 
 		// Ten frames of output against one frame of microphone, which is what a
 		// device with a long period against a short one looks like.
 		for _ in 0..10 {
 			play(&mut prod, 0.5);
 		}
-		canceller.process(&mut vec![0.0f32; frame]);
+		canceller.process(&mut vec![0.0f32; frame], std::time::Instant::now());
 
 		let queued = canceller
 			.inner
@@ -900,9 +865,9 @@ mod tests {
 			.unwrap()
 			.reference
 			.as_ref()
-			.map_or(0, |r| r.available_frames());
+			.map_or(0, |r| r.queued());
 		assert!(
-			queued < REFERENCE_FRAME,
+			queued == 0,
 			"{queued} reference frames were left queued as standing delay"
 		);
 	}
@@ -915,8 +880,8 @@ mod tests {
 		assert!(canceller.inner.state.lock().unwrap().reference.is_none());
 
 		let mut buf = vec![0.5f32; frame(48_000) * 2 * 2];
-		canceller.process(&mut buf);
-		canceller.process(&mut buf);
+		canceller.process(&mut buf, std::time::Instant::now());
+		canceller.process(&mut buf, std::time::Instant::now());
 		assert!(buf.iter().any(|s| s.abs() > 0.01), "audio was dropped");
 	}
 
@@ -925,12 +890,13 @@ mod tests {
 	/// attenuated and delayed, with nobody talking over it.
 	struct Room {
 		canceller: Attachment,
-		prod: ResamplingProd<f32>,
+		prod: ReferenceProducer,
 		noise: Noise,
 		/// Frames played, newest last, so the delay can move mid-run.
 		history: VecDeque<Vec<f32>>,
 		delay: usize,
 		frame: usize,
+		at: Instant,
 	}
 
 	/// The most speaker-to-microphone delay [`Room`] can hold, in 10 ms frames.
@@ -971,6 +937,7 @@ mod tests {
 				history: VecDeque::with_capacity(MAX_DELAY + 1),
 				delay,
 				frame: frame(48_000),
+				at: Instant::now(),
 			}
 		}
 
@@ -984,7 +951,7 @@ mod tests {
 				reference[i * REFERENCE_CHANNELS] = *sample;
 				reference[i * REFERENCE_CHANNELS + 1] = *sample;
 			}
-			self.prod.push_interleaved(&reference);
+			self.prod.push_interleaved(&reference, self.at);
 
 			self.history.push_back(played);
 			if self.history.len() > MAX_DELAY + 1 {
@@ -995,13 +962,124 @@ mod tests {
 			let mut heard: Vec<f32> = self.history[echo].iter().map(|s| s * ATTENUATION).collect();
 
 			let before = energy(&heard);
-			self.canceller.process(&mut heard);
+			self.canceller.process(&mut heard, self.at);
+			self.at += Duration::from_millis(10);
 			(before, energy(&heard))
 		}
 	}
 
 	fn energy(samples: &[f32]) -> f64 {
 		samples.iter().map(|s| (*s as f64).powi(2)).sum()
+	}
+
+	fn speech(low: usize, high: usize, mut seed: u32) -> Vec<f32> {
+		let count = (high - low) / 50 + 1;
+		let mut phases = vec![0.0; count];
+		(0..480_000)
+			.map(|at| {
+				if at % 19_200 == 0 {
+					for phase in &mut phases {
+						seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+						*phase = f64::from(seed) / 4_294_967_296.0 * std::f64::consts::TAU;
+					}
+				}
+				if at % 19_200 >= 7_200 {
+					return 0.0;
+				}
+				(0..count)
+					.map(|i| {
+						(std::f64::consts::TAU * ((low + i * 50) * at) as f64 / 48_000.0 + phases[i]).sin() * 0.2
+							/ (count as f64).sqrt()
+					})
+					.sum::<f64>() as f32
+			})
+			.collect()
+	}
+
+	fn band_level(samples: &[f32], low: usize, high: usize) -> f64 {
+		let mut total = 0.0;
+		for frame in samples.as_chunks::<960>().0.iter() {
+			let mut energy = 0.0;
+			for frequency in (low..=high).step_by(50) {
+				let coefficient = 2.0 * (std::f64::consts::TAU * frequency as f64 / 48_000.0).cos();
+				let (mut previous, mut before) = (0.0, 0.0);
+				for sample in frame {
+					let value = f64::from(*sample) + coefficient * previous - before;
+					before = previous;
+					previous = value;
+				}
+				energy += (previous * previous + before * before - coefficient * previous * before).max(0.0) * 4.0
+					/ 960.0_f64.powi(2);
+			}
+			total += energy.sqrt();
+		}
+		total / (samples.len() / 960) as f64
+	}
+
+	#[test]
+	fn double_talk_survives_a_changing_device_buffer_delay() {
+		// Also report callback work for this fixed ten-second stream; no wall-clock
+		// timing participates in the assertions.
+		for (seed, enabled) in [(1, true), (2, true), (1, false)] {
+			let far = speech(300, 950, seed);
+			let near = speech(1500, 2950, seed + 100);
+			let control = detached();
+			control.set_enabled(enabled);
+			let canceller = control.attach(48_000, 2).unwrap();
+			let mut reference = tap(&canceller);
+			let mut output = Vec::new();
+			let origin = Instant::now() + Duration::from_secs(1);
+			let measured = Instant::now();
+			for frame in 0..1_000 {
+				let played: Vec<f32> = far[frame * 480..(frame + 1) * 480]
+					.iter()
+					.flat_map(|sample| [sample * 0.667; 2])
+					.collect();
+				reference.push_interleaved(&played, origin + Duration::from_millis(frame as u64 * 10));
+				let delay = if frame < 400 {
+					120
+				} else if frame / 100 % 2 == 0 {
+					150
+				} else {
+					90
+				};
+				let mut captured: Vec<f32> = (frame * 480..(frame + 1) * 480)
+					.flat_map(|at| {
+						let echo = at.checked_sub(delay * 48).map_or(0.0, |index| far[index] * 0.667);
+						[echo + if frame >= 400 { near[at - 400 * 480] } else { 0.0 }; 2]
+					})
+					.collect();
+				canceller.process(
+					&mut captured,
+					origin + Duration::from_millis(frame as u64 * 10) - Duration::from_millis(delay as u64),
+				);
+				output.extend(captured.iter().step_by(2).copied());
+			}
+			let own = band_level(&output[288_000..], 300, 950);
+			let reply = band_level(&output[288_000..], 1500, 2950);
+			let unit = far[288_000..]
+				.as_chunks::<960>()
+				.0
+				.iter()
+				.map(|frame| (frame.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / 960.0).sqrt() * 0.667)
+				.sum::<f64>()
+				/ 200.0;
+			println!(
+				"seed {seed}, enabled={enabled}: own={own}, reply={reply}, ratio={}, 10s processed in {:?}",
+				own / reply,
+				measured.elapsed()
+			);
+			assert!(reply > 0.1 * unit, "near voice was lost: {reply}");
+			if enabled {
+				assert!(
+					own < 0.05 * reply,
+					"seed {seed}: own {own}, reply {reply}, ratio {}",
+					own / reply
+				);
+			} else {
+				assert!(own >= 0.05 * reply, "the uncancelled echo was not detected");
+			}
+		}
 	}
 
 	/// The point of the whole module: audio played out the speaker and picked up
@@ -1130,10 +1208,8 @@ mod tests {
 			// Drain the tap the way the microphone callback would, and add up
 			// what the speaker was given.
 			let mut state = canceller.inner.state.lock().unwrap();
-			while let Some(reference) = state.reference.as_mut()
-				&& reference.available_frames() >= REFERENCE_FRAME
-			{
-				reference.read_interleaved(&mut buf, false);
+			if let Some(reference) = state.reference.as_mut() {
+				reference.fill(Instant::now() - Duration::from_millis(20), &mut buf);
 				energy += buf.iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
 			}
 		}
