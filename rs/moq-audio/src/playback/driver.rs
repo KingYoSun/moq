@@ -853,13 +853,29 @@ impl Driver {
 		// never do).
 		let mut scratch = vec![0.0f32; SCRATCH_FRAMES * config.channels as usize];
 
+		let rate = config.sample_rate;
+		let channels = usize::from(config.channels);
+		#[cfg(feature = "aec")]
+		let mut clock = crate::aec::reference::Clock::default();
 		device
 			.build_output_stream::<T, _, _>(
 				config,
-				move |data, _| {
+				move |data, info| {
+					#[cfg(feature = "aec")]
+					let at = {
+						let timestamp = info.timestamp();
+						clock.at(timestamp.callback, timestamp.playback)
+					};
+					#[cfg(not(feature = "aec"))]
+					let at = {
+						let _ = info;
+						std::time::Instant::now()
+					};
+					let mut offset = 0;
 					for chunk in data.chunks_mut(scratch.len()) {
 						let scratch = &mut scratch[..chunk.len()];
-						mixer.fill(scratch);
+						mixer.fill(scratch, at + Duration::from_secs_f64(offset as f64 / f64::from(rate)));
+						offset += chunk.len() / channels;
 						for (out, sample) in chunk.iter_mut().zip(scratch.iter()) {
 							*out = T::from_sample(*sample);
 						}
