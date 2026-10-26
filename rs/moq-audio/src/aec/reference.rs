@@ -186,13 +186,26 @@ impl Consumer {
 			.next
 			.filter(|(_, expected)| at.max(*expected) - at.min(*expected) < duration(REFERENCE_FRAME) / 2);
 		let target = at + headroom;
-		let cursor = continued.map(|(index, _)| index).or_else(|| {
-			self.history
-				.iter()
-				.min_by_key(|frame| frame.at.max(target) - frame.at.min(target))
-				.filter(|frame| frame.at.max(target) - frame.at.min(target) < duration(REFERENCE_FRAME) / 2)
-				.map(|frame| frame.index)
-		});
+		let cursor = continued
+			.map(|(index, _)| index)
+			.or_else(|| {
+				self.history
+					.iter()
+					.min_by_key(|frame| frame.at.max(target) - frame.at.min(target))
+					.filter(|frame| frame.at.max(target) - frame.at.min(target) < duration(REFERENCE_FRAME) / 2)
+					.map(|frame| frame.index)
+			})
+			.or_else(|| {
+				// Independent device clocks can place capture beyond the render
+				// projection. Use a complete frame that actually exists, not silence
+				// manufactured by that clock estimate.
+				let last = self.history.back()?;
+				if target < last.end() {
+					return None;
+				}
+				let start = (last.index + last.len as u64).checked_sub((output.len() / REFERENCE_CHANNELS) as u64)?;
+				(start >= self.history.front()?.index).then_some(start)
+			});
 		let Some(mut index) = cursor else {
 			self.next = None;
 			return;
@@ -213,7 +226,14 @@ impl Consumer {
 				break;
 			}
 		}
-		self.next = (copied == output.len()).then_some((index, at + duration(output.len() / REFERENCE_CHANNELS)));
+		// Keep the next unconsumed index while waiting for more render data;
+		// seeking again here could replay the previous frame.
+		let awaiting_render = self
+			.history
+			.back()
+			.is_some_and(|last| index == last.index + last.len as u64);
+		self.next = (copied == output.len() || awaiting_render)
+			.then_some((index, at + duration(output.len() / REFERENCE_CHANNELS)));
 	}
 }
 
@@ -251,6 +271,30 @@ mod tests {
 			initially_late.project(cpal::StreamInstant::from_millis(1_150)),
 			origin + Duration::from_millis(151)
 		);
+	}
+
+	#[test]
+	fn a_late_capture_clock_uses_available_pcm_without_replaying_it() {
+		let (mut producer, mut consumer) = channel(48_000);
+		let at = Instant::now();
+		let source: Vec<f32> = (0..1_024).flat_map(|i| [i as f32 / 1_024.0; 2]).collect();
+		producer.push_interleaved(&source[..1_024], at);
+		let mut heard = [0.0; 960];
+		consumer.fill(at + Duration::from_millis(40), Duration::ZERO, &mut heard);
+		assert!(
+			heard.as_slice() == &source[64..1_024],
+			"a clock estimate discarded the available render frame"
+		);
+		for ms in [50, 60] {
+			consumer.fill(at + Duration::from_millis(ms), Duration::ZERO, &mut heard);
+			assert!(
+				heard.iter().all(|v| *v == 0.0),
+				"an exhausted render frame was replayed"
+			);
+		}
+		producer.push_interleaved(&source[1_024..], at + duration(512));
+		consumer.fill(at + Duration::from_millis(70), Duration::ZERO, &mut heard);
+		assert!(heard.as_slice() == &source[1_024..1_984]);
 	}
 
 	#[test]
