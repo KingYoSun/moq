@@ -127,6 +127,9 @@ controls alive.
 Echo cancellation matches the playback reference to each microphone frame using
 device timestamps. A bounded history keeps delayed callbacks from changing which
 sound is subtracted, while microphone delivery keeps its existing frame pacing.
+Timestamps select the reference position at the start and on device-buffer steps.
+Between steps the reference keeps the exact played sample sequence, so small
+timestamp measurement noise does not distort the waveform used by the canceller.
 
 ```bash
 cargo add moq-audio --features playback                # decode and play the example above

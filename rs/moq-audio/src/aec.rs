@@ -1020,7 +1020,14 @@ mod tests {
 	fn double_talk_survives_a_changing_device_buffer_delay() {
 		// Also report callback work for this fixed ten-second stream; no wall-clock
 		// timing participates in the assertions.
-		for (seed, enabled) in [(1, true), (2, true), (1, false)] {
+		for (seed, enabled, capture_jitter, render_jitter) in [
+			(1, true, 0, 0),
+			(2, true, 0, 0),
+			(1, false, 0, 0),
+			(1, true, 500, 0),
+			(1, true, 0, 500),
+			(1, true, 1_000, 1_000),
+		] {
 			let far = speech(300, 950, seed);
 			let near = speech(1500, 2950, seed + 100);
 			let control = detached();
@@ -1035,7 +1042,12 @@ mod tests {
 					.iter()
 					.flat_map(|sample| [sample * 0.667; 2])
 					.collect();
-				reference.push_interleaved(&played, origin + Duration::from_millis(frame as u64 * 10));
+				reference.push_interleaved(
+					&played,
+					origin
+						+ Duration::from_millis(frame as u64 * 10)
+						+ Duration::from_micros(if frame % 3 == 0 { render_jitter } else { 0 }),
+				);
 				let delay = if frame < 400 {
 					120
 				} else if frame / 100 % 2 == 0 {
@@ -1051,7 +1063,8 @@ mod tests {
 					.collect();
 				canceller.process(
 					&mut captured,
-					origin + Duration::from_millis(frame as u64 * 10) - Duration::from_millis(delay as u64),
+					origin + Duration::from_millis(frame as u64 * 10) - Duration::from_millis(delay as u64)
+						+ Duration::from_micros(if frame % 2 == 0 { capture_jitter } else { 0 }),
 				);
 				output.extend(captured.iter().step_by(2).copied());
 			}
@@ -1065,7 +1078,7 @@ mod tests {
 				.sum::<f64>()
 				/ 200.0;
 			println!(
-				"seed {seed}, enabled={enabled}: own={own}, reply={reply}, ratio={}, 10s processed in {:?}",
+				"seed {seed}, enabled={enabled}, capture_jitter={capture_jitter}, render_jitter={render_jitter}: own={own}, reply={reply}, ratio={}, 10s processed in {:?}",
 				own / reply,
 				measured.elapsed()
 			);

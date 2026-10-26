@@ -48,6 +48,7 @@ impl Clock {
 
 struct Frame {
 	at: Instant,
+	index: u64,
 	len: usize,
 	samples: [f32; REFERENCE_FRAME * REFERENCE_CHANNELS],
 }
@@ -73,6 +74,8 @@ pub(crate) struct Producer {
 pub(crate) struct Consumer {
 	queue: HeapCons<Frame>,
 	history: VecDeque<Frame>,
+	// The next sample and capture time. Device-time noise must not rewrite PCM.
+	next: Option<(u64, Instant)>,
 }
 
 pub(crate) fn channel(rate: u32) -> (Producer, Consumer) {
@@ -90,6 +93,7 @@ pub(crate) fn channel(rate: u32) -> (Producer, Consumer) {
 		Consumer {
 			queue: received,
 			history: VecDeque::with_capacity(CAPACITY),
+			next: None,
 		},
 	)
 }
@@ -103,11 +107,13 @@ impl Producer {
 			at + Duration::from_secs_f64(-pending)
 		};
 		let mut produced = 0;
+		let base = self.output;
 		let queue = &mut self.queue;
 		let mut send = |samples: &[f32]| {
 			for chunk in samples.chunks(REFERENCE_FRAME * REFERENCE_CHANNELS) {
 				let mut frame = Frame {
 					at: at + duration(produced),
+					index: base + produced as u64,
 					len: chunk.len() / REFERENCE_CHANNELS,
 					samples: [0.0; REFERENCE_FRAME * REFERENCE_CHANNELS],
 				};
@@ -144,6 +150,7 @@ impl Consumer {
 	pub(super) fn clear(&mut self) {
 		while self.queue.try_pop().is_some() {}
 		self.history.clear();
+		self.next = None;
 	}
 
 	pub(super) fn available_until(&mut self) -> Option<Instant> {
@@ -153,16 +160,6 @@ impl Consumer {
 
 	fn drain(&mut self) {
 		while let Some(frame) = self.queue.try_pop() {
-			// A shorter device buffer replaces audio that had been queued for later.
-			while self.history.back().is_some_and(|last| last.at >= frame.at) {
-				self.history.pop_back();
-			}
-			if let Some(last) = self.history.back_mut()
-				&& last.end() > frame.at
-			{
-				last.len =
-					(frame.at.duration_since(last.at).as_secs_f64() * f64::from(REFERENCE_RATE)).round() as usize;
-			}
 			if self.history.len() == CAPACITY {
 				self.history.pop_front();
 			}
@@ -180,32 +177,40 @@ impl Consumer {
 			self.history.pop_front();
 		}
 		output.fill(0.0);
-		let mut index = 0;
-		for (offset, sample) in output.as_chunks_mut::<REFERENCE_CHANNELS>().0.iter_mut().enumerate() {
-			let time = at + duration(offset);
-			while index < self.history.len() && self.history[index].end() <= time {
-				index += 1;
-			}
-			let Some(frame) = self.history.get(index) else { break };
-			if time < frame.at {
+		// Seek once, and again on a buffer step of half a processing frame.
+		// Between those points preserve the exact played sample sequence: slicing
+		// or interpolating it on each timestamp observation creates a moving echo.
+		let continued = self
+			.next
+			.filter(|(_, expected)| at.max(*expected) - at.min(*expected) < duration(REFERENCE_FRAME) / 2);
+		let cursor = continued.map(|(index, _)| index).or_else(|| {
+			self.history
+				.iter()
+				.min_by_key(|frame| frame.at.max(at) - frame.at.min(at))
+				.filter(|frame| frame.at.max(at) - frame.at.min(at) < duration(REFERENCE_FRAME) / 2)
+				.map(|frame| frame.index)
+		});
+		let Some(mut index) = cursor else {
+			self.next = None;
+			return;
+		};
+		let mut copied = 0;
+		for frame in &self.history {
+			if index < frame.index || index >= frame.index + frame.len as u64 {
 				continue;
 			}
-			let position = time.duration_since(frame.at).as_secs_f64() * f64::from(REFERENCE_RATE);
-			let first = (position.floor() as usize).min(frame.len - 1);
-			let fraction = (position - first as f64) as f32;
-			for (channel, output_sample) in sample.iter_mut().enumerate() {
-				let a = frame.samples[first * REFERENCE_CHANNELS + channel];
-				let b = if first + 1 < frame.len {
-					frame.samples[(first + 1) * REFERENCE_CHANNELS + channel]
-				} else {
-					self.history
-						.get(index + 1)
-						.filter(|next| next.at.saturating_duration_since(frame.end()) < duration(1))
-						.map_or(0.0, |next| next.samples[channel])
-				};
-				*output_sample = a + (b - a) * fraction;
+			let offset = (index - frame.index) as usize;
+			let frames = (frame.len - offset).min((output.len() - copied) / REFERENCE_CHANNELS);
+			let count = frames * REFERENCE_CHANNELS;
+			output[copied..copied + count]
+				.copy_from_slice(&frame.samples[offset * REFERENCE_CHANNELS..offset * REFERENCE_CHANNELS + count]);
+			index += frames as u64;
+			copied += count;
+			if copied == output.len() {
+				break;
 			}
 		}
+		self.next = (copied == output.len()).then_some((index, at + duration(output.len() / REFERENCE_CHANNELS)));
 	}
 }
 
@@ -246,22 +251,26 @@ mod tests {
 	}
 
 	#[test]
-	fn looks_up_samples_in_device_time_and_interpolates_between_them() {
+	fn device_time_selects_the_start_then_timestamp_noise_preserves_the_pcm() {
 		let (mut producer, mut consumer) = channel(48_000);
 		let at = Instant::now();
 		let samples: Vec<f32> = (0..1_920).flat_map(|i| [i as f32 / 480.0; 2]).collect();
 		producer.push_interleaved(&samples, at);
 		let mut heard = [0.0; 960];
 		consumer.fill(at + duration(480) + Duration::from_secs_f64(0.5 / 48_000.0), &mut heard);
-		for (i, frame) in heard.as_chunks::<2>().0.iter().enumerate() {
-			let expected = (480.5 + i as f32) / 480.0;
-			assert!((frame[0] - expected).abs() < 0.00001, "{i}: {} != {expected}", frame[0]);
-			assert_eq!(frame[0], frame[1]);
-		}
+		assert_eq!(&heard, &samples[960..1_920]);
+		consumer.fill(at + duration(960) + Duration::from_micros(500), &mut heard);
+		assert_eq!(&heard, &samples[1_920..2_880]);
+		consumer.fill(at, &mut heard);
+		assert_eq!(
+			&heard,
+			&samples[..960],
+			"a device-buffer step must reposition the reference"
+		);
 	}
 
 	#[test]
-	fn gaps_are_silence_and_newer_device_times_replace_overlapping_audio() {
+	fn overlapping_predictions_preserve_pcm_and_an_exhausted_reference_recovers() {
 		let (mut producer, mut consumer) = channel(48_000);
 		let at = Instant::now();
 		producer.push_interleaved(&[1.0; 960], at);
@@ -269,10 +278,19 @@ mod tests {
 		producer.push_interleaved(&[3.0; 960], at + Duration::from_millis(30));
 		let mut heard = [0.0; 960];
 		consumer.fill(at, &mut heard);
-		assert!(heard[..480].iter().all(|v| (*v - 1.0).abs() < 0.0001));
-		assert!(heard[480..].iter().all(|v| (*v - 2.0).abs() < 0.0001));
+		assert!(heard.iter().all(|v| *v == 1.0));
+		consumer.fill(at + Duration::from_millis(10), &mut heard);
+		assert!(
+			heard.iter().all(|v| *v == 2.0),
+			"timing estimates must not delete played samples"
+		);
 		consumer.fill(at + Duration::from_millis(20), &mut heard);
+		assert!(heard.iter().all(|v| *v == 3.0));
+		consumer.fill(at + Duration::from_millis(30), &mut heard);
 		assert!(heard.iter().all(|v| *v == 0.0));
+		producer.push_interleaved(&[4.0; 960], at + Duration::from_millis(40));
+		consumer.fill(at + Duration::from_millis(40), &mut heard);
+		assert!(heard.iter().all(|v| *v == 4.0));
 	}
 
 	#[test]
@@ -300,7 +318,7 @@ mod tests {
 	}
 
 	#[test]
-	fn resampling_preserves_the_render_clock() {
+	fn resampling_preserves_the_backend_pcm_through_timestamp_noise() {
 		let (mut producer, mut consumer) = channel(44_100);
 		let at = Instant::now();
 		let source: Vec<f32> = (0..8_820)
@@ -325,12 +343,19 @@ mod tests {
 			true,
 		);
 		let mut heard = [0.0; 960];
-		consumer.fill(at + Duration::from_millis(100), &mut heard);
-		for (actual, expected) in heard.iter().zip(&expected[9_600..10_560]) {
-			assert!(
-				(actual - expected).abs() < 0.0001,
-				"resampled reference shifted: {actual} != {expected}"
+		consumer.available_until();
+		let start = consumer.history.front().unwrap().at;
+		for block in 0..10 {
+			consumer.fill(
+				start + duration(block * 480) + Duration::from_micros(if block % 2 == 0 { 0 } else { 500 }),
+				&mut heard,
 			);
+			for (actual, expected) in heard.iter().zip(&expected[block * 960..(block + 1) * 960]) {
+				assert!(
+					(actual - expected).abs() < 0.0001,
+					"resampled reference changed: {actual} != {expected}"
+				);
+			}
 		}
 	}
 }
