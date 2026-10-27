@@ -1026,6 +1026,7 @@ mod tests {
 			(1, true, 500, 0),
 			(1, true, 0, 500),
 			(1, true, 1_000, 1_000),
+			(1, true, 9_000, 0),
 		] {
 			let far = speech(300, 950, seed);
 			let near = speech(1500, 2950, seed + 100);

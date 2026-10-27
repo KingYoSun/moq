@@ -214,6 +214,13 @@ impl Consumer {
 			self.next = None;
 			return;
 		};
+		// A forward capture clock cannot make consumed PCM new again. A backward
+		// device-buffer step can still seek into the retained history.
+		if let Some((next, expected)) = self.next
+			&& at + duration(output.len() / REFERENCE_CHANNELS) >= expected
+		{
+			index = index.max(next);
+		}
 		let mut copied = 0;
 		for frame in &self.history {
 			if index < frame.index || index >= frame.index + frame.len as u64 {
