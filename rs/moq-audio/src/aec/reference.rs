@@ -197,13 +197,17 @@ impl Consumer {
 			})
 			.or_else(|| {
 				// Independent device clocks can place capture beyond the render
-				// projection. Use a complete frame that actually exists, not silence
-				// manufactured by that clock estimate.
+				// projection. Leave one complete frame for the next capture callback
+				// when available: render may arrive just after that callback.
 				let last = self.history.back()?;
 				if target < last.end() {
 					return None;
 				}
-				let start = (last.index + last.len as u64).checked_sub((output.len() / REFERENCE_CHANNELS) as u64)?;
+				let frames = (output.len() / REFERENCE_CHANNELS) as u64;
+				let end = last.index + last.len as u64;
+				let retained = end - self.history.front()?.index;
+				let reserve = if retained >= frames * 2 { frames * 2 } else { frames };
+				let start = end.checked_sub(reserve)?;
 				(start >= self.history.front()?.index).then_some(start)
 			});
 		let Some(mut index) = cursor else {
@@ -270,6 +274,22 @@ mod tests {
 		assert_eq!(
 			initially_late.project(cpal::StreamInstant::from_millis(1_150)),
 			origin + Duration::from_millis(151)
+		);
+	}
+
+	#[test]
+	fn late_clock_keeps_a_render_frame_for_the_next_capture_callback() {
+		let (mut producer, mut consumer) = channel(48_000);
+		let at = Instant::now();
+		producer.push_interleaved(&[1.0; 960], at);
+		producer.push_interleaved(&[2.0; 960], at + Duration::from_millis(10));
+		let mut heard = [0.0; 960];
+		consumer.fill(at + Duration::from_millis(35), Duration::ZERO, &mut heard);
+		let first = heard[0];
+		consumer.fill(at + Duration::from_millis(45), Duration::ZERO, &mut heard);
+		assert!(
+			heard.iter().all(|value| *value == first + 1.0),
+			"available PCM was replaced by silence between render callbacks"
 		);
 	}
 
