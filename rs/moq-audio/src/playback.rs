@@ -64,6 +64,10 @@ pub struct Config {
 	/// Output device, by the id [`devices`] reports. `None` opens the system
 	/// default.
 	pub device: Option<String>,
+	/// Succeed even when the device will not open, and keep retrying it the way
+	/// a device that disappeared later is retried. Sinks take writes in the
+	/// meantime, and their samples go nowhere until the device comes up.
+	pub wait_for_device: bool,
 }
 
 /// An open output device, mixing up to 64 [`Sink`]s into it.
@@ -100,9 +104,10 @@ impl Drop for Handle {
 impl Engine {
 	/// Open the output device described by `config`.
 	///
-	/// Fails if there is no such device, or none at all. Later failures are the
-	/// driver's problem, not the caller's: it reopens the device with backoff
-	/// and existing sinks pick up where they left off.
+	/// Fails if there is no such device, or none at all, unless
+	/// [`Config::wait_for_device`] is set. Later failures are the driver's
+	/// problem, not the caller's: it reopens the device with backoff and existing
+	/// sinks pick up where they left off.
 	pub async fn open(config: Config) -> Result<Self, Error> {
 		let (commands, requests) = driver::channel();
 		let (opened, ready) = tokio::sync::oneshot::channel();
@@ -124,7 +129,7 @@ impl Engine {
 		// runtime: opening it, switching it, and rebuilding it after an error.
 		std::thread::Builder::new()
 			.name("moq-audio-playback".into())
-			.spawn(move || driver::run(requests, commands, shared, config.device, opened))
+			.spawn(move || driver::run(requests, commands, shared, config, opened))
 			.map_err(|err| Error::Playback(format!("cannot spawn the playback thread: {err}")))?;
 
 		ready
