@@ -686,31 +686,20 @@ impl FailureReporter {
 ///
 /// `opened` reports whether the first device came up, so
 /// [`Engine::open`](super::Engine::open) can fail fast on a machine with no
-/// output rather than handing back a handle that plays into nothing.
+/// output rather than handing back a handle that plays into nothing, unless the
+/// caller asked to wait for one.
 pub(super) fn run(
 	requests: Requests,
 	commands: Commands,
 	shared: Arc<Shared>,
-	device: Option<String>,
+	config: super::Config,
 	opened: tokio::sync::oneshot::Sender<Result<(), Error>>,
 ) {
-	let mut driver = Driver {
-		shared,
-		commands,
-		device,
-		stream: None,
-		retired: None,
-		failures: None,
-		retry: RETRY_MIN,
-		retry_at: None,
-		underruns: 0,
-		unclassified: 0,
-		window: Instant::now(),
-	};
+	let mut driver = Driver::new(commands, shared, config.device);
 
 	requests.attach();
 
-	let first = driver.start();
+	let first = driver.open(config.wait_for_device);
 	let started = first.is_ok();
 	if opened.send(first).is_err() || !started {
 		// Either the caller gave up on `open`, or there is no device to play
@@ -766,6 +755,36 @@ struct Driver {
 }
 
 impl Driver {
+	fn new(commands: Commands, shared: Arc<Shared>, device: Option<String>) -> Self {
+		Self {
+			shared,
+			commands,
+			device,
+			stream: None,
+			retired: None,
+			failures: None,
+			retry: RETRY_MIN,
+			retry_at: None,
+			underruns: 0,
+			unclassified: 0,
+			window: Instant::now(),
+		}
+	}
+
+	/// The first start. A caller waiting for a device gets the same backoff as a
+	/// device that disappeared later, and no error.
+	fn open(&mut self, wait_for_device: bool) -> Result<(), Error> {
+		let result = self.start();
+		match result {
+			Err(err) if wait_for_device => {
+				tracing::debug!(%err, "audio output unavailable, waiting for one");
+				self.retry_at = Some(self.schedule());
+				Ok(())
+			}
+			result => result,
+		}
+	}
+
 	/// Open the device, start mixing into it, and move every sink onto it.
 	fn start(&mut self) -> Result<(), Error> {
 		let device = super::device::open(self.device.as_deref())?;
@@ -1341,6 +1360,39 @@ mod tests {
 				"steady sink churn starved the device retry"
 			);
 		}
+	}
+
+	/// A caller waiting for a device gets no error and a retry to wake on; any
+	/// other caller gets the error and no driver.
+	#[test]
+	fn waiting_for_a_device_schedules_a_retry_instead_of_failing() {
+		let (commands, _requests) = channel();
+		let driver = || Driver::new(commands.clone(), Arc::new(Shared::default()), Some("no-such-device".into()));
+
+		let mut failing = driver();
+		assert!(failing.open(false).is_err());
+		assert!(failing.retry_at.is_none());
+
+		let mut waiting = driver();
+		assert!(waiting.open(true).is_ok());
+		assert!(waiting.retry_at.is_some());
+	}
+
+	/// The engine a waiting caller gets takes sinks and writes, and its driver
+	/// is alive: a switch reaches it instead of finding it stopped.
+	#[tokio::test]
+	async fn an_engine_waiting_for_a_device_takes_writes() {
+		let mut config = crate::playback::Config::default();
+		config.device = Some("no-such-device".into());
+		assert!(crate::playback::Engine::open(config.clone()).await.is_err());
+
+		config.wait_for_device = true;
+		let engine = crate::playback::Engine::open(config.clone()).await.expect("waiting");
+		let mut sink = engine.sink(Input::default()).expect("sink");
+		let _ = sink.write(&[0; 960 * 2 * 4]).expect("write");
+
+		let error = engine.switch(config).await.expect_err("still no device").to_string();
+		assert!(!error.contains("stopped"), "{error}");
 	}
 
 	/// An early wake costs a lap, not a retry: the deadline is what decides,
