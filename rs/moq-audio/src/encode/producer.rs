@@ -76,6 +76,10 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// (re)start. Emitted PTS = `epoch + frames_produced / codec_rate`. `None`
 	/// until the first write so the next frame re-anchors to its timestamp.
 	epoch_us: Option<u64>,
+	/// Where the newest published packet ends. A re-anchored epoch never lands
+	/// before it: the sample-count PTS can run ahead of the wall clock, and a
+	/// consumer aborts a track whose groups fall below the live edge it reached.
+	published_end_us: Option<u64>,
 	/// An encoder reset that still needs a marker group before its next packet.
 	pending_discontinuity: bool,
 	/// Whether a marker group already separates the next packet from prior codec state.
@@ -184,6 +188,7 @@ impl<E: CatalogExt> Reserved<E> {
 			pending: Vec::new(),
 			frames_produced: 0,
 			epoch_us: None,
+			published_end_us: None,
 			pending_discontinuity: false,
 			decoder_boundary: true,
 			activity: Activity::Active,
@@ -339,7 +344,10 @@ impl<E: CatalogExt> Producer<E> {
 
 		let timestamp_us = u64::try_from(frame.timestamp.as_micros())
 			.map_err(|_| Error::Unsupported(format!("frame timestamp {:?} out of range", frame.timestamp)))?;
-		let epoch_us = *self.epoch_us.get_or_insert(timestamp_us);
+		// The first packet of an epoch is stamped `folded_delay` samples before it.
+		let delay_us = (self.encoder.folded_delay() as u64 * 1_000_000).div_ceil(u64::from(self.encoder.codec_rate()));
+		let floor_us = self.published_end_us.map_or(0, |end| end + delay_us);
+		let epoch_us = *self.epoch_us.get_or_insert(timestamp_us.max(floor_us));
 
 		let input = &self.input;
 		let (format, channels) = (input.format, input.layout.channels());
@@ -374,7 +382,10 @@ impl<E: CatalogExt> Producer<E> {
 			)?;
 			self.frames_produced += self.encoder.frame_size() as u64;
 			self.activity = packet.activity;
+			let frame_us = self.encoder.frame_size() as u128 * 1_000_000 / u128::from(self.encoder.codec_rate());
+			let end_us = u64::try_from(timestamp.as_micros() + frame_us).map_err(|_| moq_net::TimeOverflow)?;
 			Self::publish(&mut self.track, packet, timestamp)?;
+			self.published_end_us = Some(end_us);
 			self.decoder_boundary = false;
 		}
 
@@ -1013,6 +1024,17 @@ mod tests {
 		// appear in the PTS (otherwise audio drifts behind a wall-clock video track).
 		let pts = published_pts(&[full_frame(0), full_frame(5_000_000)], Some(1)).await;
 		assert_eq!(pts, vec![0, 5_000_000]);
+	}
+
+	#[tokio::test]
+	async fn reset_epoch_never_lands_before_the_published_audio() {
+		// The sample-count PTS can run ahead of the wall clock (a late first read, then a
+		// backlog). A capture drop then re-anchors behind what was published, and a
+		// consumer aborts the whole track as a rewind. The epoch resumes where the
+		// published audio ends instead.
+		let frames = [1_000_000, 1_000_000, 1_000_000, 1_010_000, 1_010_000].map(full_frame);
+		let pts = published_pts(&frames, Some(3)).await;
+		assert_eq!(pts, vec![1_000_000, 1_020_000, 1_040_000, 1_060_000, 1_080_000]);
 	}
 
 	/// Finish leaves the handle, so abort can still run.
