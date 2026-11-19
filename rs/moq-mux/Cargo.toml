@@ -21,14 +21,14 @@ bytes = { workspace = true }
 crc = "3"
 ebml-iterable = { workspace = true }
 h264-parser = { version = "0.4.2" }
-hang = "0.21.21"
+hang = "0.21.24"
 kio = "0.6.4"
 memchr = "2"
-moq-binary = "0.1.20"
-moq-json = "0.5.18"
-moq-loc = "0.2.29"
+moq-binary = "0.1.23"
+moq-json = "0.5.21"
+moq-loc = "0.2.32"
 moq-msf = "0.5.1"
-moq-net = "0.3.20"
+moq-net = "0.3.23"
 mp4-atom = { version = "0.15", features = ["tokio", "bytes", "serde"] }
 mpeg2ts = "0.6.0"
 num_enum = { workspace = true }
